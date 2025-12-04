@@ -1,8 +1,10 @@
 import argparse
+import random
 import hydra
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
+from tqdm import tqdm
 from terasim.logger.infoextractor import InfoExtractor
 from terasim.simulator import Simulator
 
@@ -29,8 +31,8 @@ def main(config_path: str) -> None:
 
     base_dir = Path(config.output.dir) / config.output.name / "raw_data" / config.output.nth
     base_dir.mkdir(parents=True, exist_ok=True)
-    env = NADEWithAV( # NADEWithAV or NADE
-        av_cfg = config.environment.parameters.AV_cfg,
+    env = NADEWithAV(
+        av_cfg=config.environment.parameters.AV_cfg,
         vehicle_factory=NDEVehicleFactory(cfg=config.environment.parameters),
         vru_factory=NDEVulnerableRoadUserFactory(cfg=config.environment.parameters),
         info_extractor=InfoExtractor,
@@ -46,16 +48,23 @@ def main(config_path: str) -> None:
     # Paths already resolved in config
     sumo_net_file = config.input.sumo_net_file
     sumo_config_file = config.input.sumo_config_file
+    # sumo_additional_file = config.input.sumo_additional_file
+    sumo_additional_file = "./vTypeDistributions.add.xml"
 
     sim = Simulator(
         sumo_net_file_path=sumo_net_file,
         sumo_config_file_path=sumo_config_file,
+        sumo_additional_file_path=sumo_additional_file,
         num_tries=10,
         gui_flag=config.simulator.parameters.gui_flag,
         realtime_flag=config.simulator.parameters.realtime_flag,
         output_path=base_dir,
-        sumo_output_file_types=config.simulator.parameters.sumo_output_file_types,
-        traffic_scale=config.simulator.parameters.traffic_scale if hasattr(config.simulator.parameters, "traffic_scale") else 1,
+        sumo_output_file_types=["collision"],
+        traffic_scale=(
+            config.simulator.parameters.traffic_scale
+            if hasattr(config.simulator.parameters, "traffic_scale")
+            else 1
+        ),
         additional_sumo_args=[
             "--device.bluelight.explicit",
             "true",
@@ -70,25 +79,22 @@ def main(config_path: str) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run TeraSim debug experiments with YAML configuration")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/simulation/test.yaml",
-        help="Path to YAML configuration file (default: configs/simulation/test.yaml)"
-    )
+    # Get all yaml files in examples/scenarios directory
+    config_dir = Path(__file__).parent / "examples" / "scenarios"
+    # yaml_files = sorted(config_dir.glob("*.yaml"), key=lambda x: int(''.join(filter(str.isdigit, x.stem)) or '0'))
+    # yaml_files = ["examples/scenarios/cutin.yaml"]
+    yaml_files = [Path("/home/sdai/harry/TeraSim/jupiter/eb/test_config.yaml")]
+    # Randomly shuffle yaml files
+    random.shuffle(yaml_files)
 
-    args = parser.parse_args()
-
-    # Convert to Path object and validate
-    config_path = Path(args.config)
-    if not config_path.exists():
-        logger.error(f"Configuration file not found: {config_path}")
-        exit(1)
-
-    if not config_path.suffix.lower() in ['.yaml', '.yml']:
-        logger.error(f"Configuration file must be a YAML file: {config_path}")
-        exit(1)
-
-    logger.info(f"Running experiment with config: {config_path}")
-    main(str(config_path))
+    # Run experiments for each yaml file
+    for yaml_file in tqdm(yaml_files):
+        print(yaml_file)
+        logger.info(f"Running experiment with config: {yaml_file}")
+        main(str(yaml_file))
+        # try:
+        #     main(str(yaml_file))
+        # except Exception as e:
+        #     logger.error(f"Error running {yaml_file}: {e}")
+        #     # yaml_file.unlink()  # Delete the yaml file
+        # continue
