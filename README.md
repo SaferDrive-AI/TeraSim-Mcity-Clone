@@ -7,11 +7,10 @@
 </div>
 
 
----
 
-# TeraSim
-
-**Generative AI–Driven Autonomous Vehicle Simulation for Unknown Unsafe Events Discovery**
+<p align="center">
+<strong>Generative AI–Driven Autonomous Vehicle Simulation for Unknown Unsafe Events Discovery</strong>
+</p>
 
 ---
 
@@ -37,10 +36,13 @@ This expanded scope enables a unified pipeline from map generation to perception
 ## **🌎 New Feature: TeraSim-World**
 
 
-<img src="docs/figure/TeraSim_World.png" height="400px">
+[<img src="docs/figure/TeraSim_World.png" height="400px">](https://www.youtube.com/watch?v=75T1-2Ce0Ds)
 
+<h3 align="center">
+📄 <a href="https://arxiv.org/abs/2509.13164">arXiv</a> | 🌐 <a href="https://wjiawei.com/terasim-world-web/">Website</a> | 🎥 <a href="https://www.youtube.com/watch?v=75T1-2Ce0Ds">Video</a>
+</h3>
 
-**TeraSim-World** automatically synthesizes geographically grounded, safety-critical data for End-to-End autonomous driving **anywhere in the world**. See 📄 [paper](https://arxiv.org/abs/2503.03629) and 🌐 [videos](https://wjiawei.com/terasim-world-web/) for details.
+**TeraSim-World** automatically synthesizes geographically grounded, safety-critical data for End-to-End autonomous driving **anywhere in the world**. 
 
 ✨ **Key Capabilities:**
 - 🗺️ **Global Coverage**: Generate realistic driving scenarios for any location worldwide
@@ -48,24 +50,6 @@ This expanded scope enables a unified pipeline from map generation to perception
 - 🔄 **NVIDIA Cosmos-Drive Compatible**: Direct integration with video generation model training platforms
 
 🚀 **Source code is now available!** See [TeraSim_World.md](docs/TeraSim_World.md) for getting started guide.
-
-
-## **🎥 Demo Video**
-
-## Background and Foundations
-
-TeraSim builds on prior research in naturalistic and adversarial driving environments:
-
-* **NDE** – Learning naturalistic driving environment with statistical realism
-  [Paper](https://doi.org/10.1038/s41467-023-37677-5) | [Code](https://github.com/michigan-traffic-lab/Learning-Naturalistic-Driving-Environment)
-
-* **NADE** – Intelligent driving intelligence test with naturalistic and adversarial environment
-  [Paper](https://doi.org/10.1038/s41467-021-21007-8) | [Code](https://github.com/michigan-traffic-lab/Naturalistic-and-Adversarial-Driving-Environment)
-
-* **D2RL** – Dense deep reinforcement learning for AV safety validation
-  [Paper](https://doi.org/10.1038/s41586-023-05732-2) | [Code](https://github.com/michigan-traffic-lab/Dense-Deep-Reinforcement-Learning)
-
-These works provide the statistical and algorithmic basis for TeraSim’s scenario generation and risk discovery.
 
 ---
 
@@ -120,12 +104,14 @@ TeraSim/
 ```bash
 git clone https://github.com/mcity/TeraSim.git
 cd TeraSim
+conda create -n terasim python=3.10 -y
+conda activate terasim
 ./setup_environment.sh
 ```
 
 This script installs all required Python packages and dependencies, including [SUMO](https://www.eclipse.org/sumo/).
 
-### Docker Installation (Recommended for Production)
+<!-- ### Docker Installation (Recommended for Production)
 
 For a containerized environment with all dependencies pre-installed:
 
@@ -136,17 +122,7 @@ docker-compose up -d --build
 docker-compose exec terasim bash
 ```
 
-See [README_DOCKER.md](README_DOCKER.md) for detailed Docker deployment instructions.
-
-### Development Environment
-
-```bash
-conda create -n terasim python=3.10
-conda activate terasim
-git clone https://github.com/mcity/TeraSim.git
-cd TeraSim
-./setup_environment.sh
-```
+See [README_DOCKER.md](README_DOCKER.md) for detailed Docker deployment instructions. -->
 
 **Requirements**
 
@@ -159,18 +135,7 @@ cd TeraSim
 
 ## Quick Start Example
 
-```python
-from terasim import Simulator
-from terasim.envs import EnvTemplate
-
-sim = Simulator("examples/maps/Mcity/sim.sumocfg")
-env = EnvTemplate()
-sim.bind_env(env)
-
-sim.start()
-sim.run(steps=1000)
-sim.close()
-```
+See [TeraSim_World.md](docs/TeraSim_World.md) for Quick Start Example.
 
 Additional examples are available in the [`examples/`](examples/) directory.
 
@@ -182,6 +147,19 @@ Contributions are welcome. Please read the [CONTRIBUTING.md](CONTRIBUTING.md) gu
 
 ---
 
+
+## Publications
+
+Explore our other research on autonomous driving testing!
+
+* **NDE** – Learning naturalistic driving environment with statistical realism
+  [Paper](https://doi.org/10.1038/s41467-023-37677-5) | [Code](https://github.com/michigan-traffic-lab/Learning-Naturalistic-Driving-Environment)
+
+* **NADE** – Intelligent driving intelligence test with naturalistic and adversarial environment
+  [Paper](https://doi.org/10.1038/s41467-021-21007-8) | [Code](https://github.com/michigan-traffic-lab/Naturalistic-and-Adversarial-Driving-Environment)
+
+* **D2RL** – Dense deep reinforcement learning for AV safety validation
+  [Paper](https://doi.org/10.1038/s41586-023-05732-2) | [Code](https://github.com/michigan-traffic-lab/Dense-Deep-Reinforcement-Learning)
 
 ## **📄 License**
 

@@ -4,7 +4,7 @@
 <img src="figure/TeraSim_World.png" height="600px">
 </div>
 
-**TeraSim-World** automatically synthesizes geographically grounded, safety-critical data for End-to-End autonomous driving **anywhere in the world**. See 📄 [paper](https://arxiv.org/abs/2503.03629) and 🌐 [videos](https://wjiawei.com/terasim-world-web/) for details.
+**TeraSim-World** automatically synthesizes geographically grounded, safety-critical data for End-to-End autonomous driving **anywhere in the world**. See 📄 [paper](https://arxiv.org/abs/2509.13164), 🌐 [website](https://wjiawei.com/terasim-world-web/), 🎥 [video](https://www.youtube.com/watch?v=75T1-2Ce0Ds) for details.
 
 
 
@@ -13,15 +13,13 @@
 ### 1. Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/mcity/TeraSim.git
 cd TeraSim
+conda create -n terasim python=3.10 -y
+conda activate terasim
 
 # Run automated setup (installs all components including TeraSim-World)
 ./setup_environment.sh
-
-# Activate environment
-conda activate terasim
 
 # Configure API keys in .env file
 # Required: OPENAI_API_KEY and GOOGLE_MAPS_API_KEY
@@ -31,11 +29,11 @@ conda activate terasim
 
 ```bash
 python scripts/generate_experiments.py \
-    --lat 42.331936167160165 \
-    --lon -83.70812725301244 \
+    --lat 42.31708742783425 \
+    --lon -83.70771003426997 \
     --bbox 500 \
     --output generated_experiments \
-    --name ann_arbor_four_way_stop
+    --name ann_arbor_roundabout
 ```
 
 **Key Parameters:**
@@ -53,7 +51,7 @@ Run simulations with visual debugging and real-time monitoring:
 python scripts/run_experiments_debug.py --config path/to/your/config.yaml
 ```
 
-Example configurations are available in `configs/simulation/example.yaml`.
+Example configurations are available in `configs/simulation/example_ann_arbor.yaml`.
 
 ### 4. Convert to Cosmos-Drive Format
 
@@ -77,6 +75,8 @@ python scripts/convert_terasim_to_cosmos.py \
 - `--vehicle_id`: ID of the ego vehicle to track
 - `--time_start/--time_end`: Time window in seconds for conversion
 - `--streetview_retrieval`: Enable real-world street view image integration
+- `--agent_clip_distance`: Radius around the ego vehicle to display nearby agents (default: 80 m)
+- `--map_clip_distance`: Radius around the ego vehicle to render map features (default: 100 m)
 
 ### 5. Use with Cosmos-Drive
 

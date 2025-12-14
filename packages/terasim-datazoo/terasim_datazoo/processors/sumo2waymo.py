@@ -201,7 +201,10 @@ class SUMO2Waymo:
             external_polylines = [[(x,y) for x,y in zip(*polyline.xy)] for polyline in right_connection_polyline_right_half_width]
             for i, polyline in enumerate(external_polylines):
                 for j, pt in enumerate(polyline):
-                    external_polylines[i][j] = (pt[0], pt[1], right_connection_shapes[i][j][2])
+                    try:
+                        external_polylines[i][j] = (pt[0], pt[1], right_connection_shapes[i][j][2])
+                    except:
+                        external_polylines[i][j] = (pt[0], pt[1], 0)
         else:
             external_polylines = [node_shape]
 
@@ -534,4 +537,7 @@ if __name__ == "__main__":
 
     converter = SUMO2Waymo("terasim_demo/e7078100-3635-4e58-a497-64e5528f08e8/map.net.xml")
     converter.parse(have_road_edges=True, have_road_lines=True)
-    converter.save_scenario(scenario_id="test", output_dir="terasim_demo/e7078100-3635-4e58-a497-64e5528f08e8")
+    scenario = converter.convert_to_scenario(scenario_id="test")
+    with open("test_map.pb", "wb") as f:
+        f.write(scenario.SerializeToString())
+    # converter.save_scenario(scenario_id="test", output_dir="terasim_demo/e7078100-3635-4e58-a497-64e5528f08e8")

@@ -162,6 +162,8 @@ input/
 Current_NADE.py
 Pre_NADE.py
 *.json
+# Allow JSON files in terasim-cosmos config directory
+!packages/terasim-cosmos/terasim_cosmos/config/*.json
 Makefile
 classes.png
 packages.png
@@ -185,3 +187,4 @@ texas_example
 README_QUICKSTART.md
 run_experiments_debug.py
 test_docker.sh
+/local_test

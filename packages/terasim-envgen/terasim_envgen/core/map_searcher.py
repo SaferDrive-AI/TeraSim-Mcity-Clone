@@ -355,15 +355,15 @@ class MapSearcher:
         save_metadata(metadata_path, metadata)
         
         # Save OSM data
-        try:
-            osm_path = self._save_osm_data_webwizard(mid_lat, mid_lon, scene_dir, bbox_size)
-        except Exception as e:
-            logger.warning(f"Failed to save OSM WebWizard data for scene {scene_dir.name}: {str(e)}")
         # try:
-        #     osm_path = self._save_osm_data_osmnx(mid_lat, mid_lon, scene_dir, bbox_size)
+        #     osm_path = self._save_osm_data_webwizard(mid_lat, mid_lon, scene_dir, bbox_size)
         # except Exception as e:
-        #     logger.warning(f"Failed to save OSM OSMNX data for scene {scene_dir.name}: {str(e)}")
-        #     return False
+        #     logger.warning(f"Failed to save OSM WebWizard data for scene {scene_dir.name}: {str(e)}")
+        try:
+            osm_path = self._save_osm_data_osmnx(mid_lat, mid_lon, scene_dir, bbox_size)
+        except Exception as e:
+            logger.warning(f"Failed to save OSM OSMNX data for scene {scene_dir.name}: {str(e)}")
+            return False
         if not osm_path:
             logger.error(f"Failed to save OSM data for scene {scene_dir.name}")
             return False
@@ -624,12 +624,11 @@ class MapSearcher:
             'carOnlyNetwork': False,
             'vehicles': {
                 'passenger': {'fringeFactor': 5, 'count': 12},
-                'bicycle': {'fringeFactor': 5, 'count': 12},
-                'pedestrian': {'fringeFactor': 5, 'count': 12}
+                # 'bicycle': {'fringeFactor': 5, 'count': 12},
+                # 'pedestrian': {'fringeFactor': 5, 'count': 12}
             },
             'roadTypes': {
-                'Highway': ['motorway', 'motorway_link', 'trunk', 'trunk_link', 'primary', 'primary_link', 'secondary', 'secondary_link', 'tertiary', 'tertiary_link', 'unclassified', 'residential', 'living_street', 'unsurfaced', 'service', 'raceway', 'bus_guideway', 'track', 'footway', 'pedestrian', 'path', 'bridleway', 'cycleway', 'step', 'steps', 'stairs'],
-                'Highway': ['motorway', 'motorway_link', 'trunk', 'trunk_link', 'primary', 'primary_link', 'secondary', 'secondary_link', 'tertiary', 'tertiary_link', 'unclassified', 'residential', 'living_street', 'raceway', 'bus_guideway', 'track', 'footway', 'pedestrian', 'path', 'bridleway', 'cycleway', 'step', 'steps', 'stairs'],
+                'Highway': ['motorway', 'motorway_link', 'trunk', 'trunk_link', 'primary', 'primary_link', 'secondary', 'secondary_link', 'tertiary', 'tertiary_link', 'unclassified', 'residential', 'living_street', "cycleway"],
                 # 'Highway': ['motorway', 'motorway_link'],
                 # 'Railway': [],
                 # 'Aeroway': [],
@@ -639,7 +638,8 @@ class MapSearcher:
             },
             'coords': [west, south, east, north],
             'outputDir': str(abs_output_dir),
-            'outputDirExistOk': True
+            'outputDirExistOk': True,
+            'options': '--default.lanewidth,3.5',
         }
         builder = Builder(data, True)
         builder.build()

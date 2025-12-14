@@ -1,6 +1,7 @@
 import argparse
 import random
 import hydra
+from datetime import datetime
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
@@ -19,55 +20,54 @@ from terasim_service.utils.base import resolve_config_paths
 # sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 
+
 def main(config_path: str) -> None:
     config = OmegaConf.load(config_path)
+    
     # Convert OmegaConf to dict for path resolution
     config_dict = OmegaConf.to_container(config, resolve=True)
+    
     # Resolve all paths in config
     config_dict = resolve_config_paths(config_dict, config_path)
-
+    
     # Convert back to OmegaConf for attribute access
     config = OmegaConf.create(config_dict)
-
-    base_dir = Path(config.output.dir) / config.output.name / "raw_data" / config.output.nth
+    
+    # Time (format: 2025-09-15_16-05-30)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    
+    base_dir = Path(config.output.dir) / config.output.name / "raw_data" / timestamp
     base_dir.mkdir(parents=True, exist_ok=True)
-    env = NADE( # NADEWithAV or NADE
-        # av_cfg = config.environment.parameters.AV_cfg,
+
+    env = NADEWithAV(
+        av_cfg = config.environment.parameters.AV_cfg,
         vehicle_factory=NDEVehicleFactory(cfg=config.environment.parameters),
         vru_factory=NDEVulnerableRoadUserFactory(cfg=config.environment.parameters),
-        info_extractor=InfoExtractor,
+        info_extractor=InfoExtractor, 
         log_flag=True,
         log_dir=base_dir,
         warmup_time_lb=config.environment.parameters.warmup_time_lb,
         warmup_time_ub=config.environment.parameters.warmup_time_ub,
         run_time=1200,
         configuration=config.environment.parameters,
-        # av_debug_control=True, # Enable debug control for AV, will use SUMO
     )
 
     # Paths already resolved in config
     sumo_net_file = config.input.sumo_net_file
     sumo_config_file = config.input.sumo_config_file
-    # sumo_additional_file = config.input.sumo_additional_file
-    sumo_additional_file = "./vTypeDistributions.add.xml"
 
     sim = Simulator(
         sumo_net_file_path=sumo_net_file,
         sumo_config_file_path=sumo_config_file,
-        sumo_additional_file_path=sumo_additional_file,
         num_tries=10,
-        gui_flag=config.simulator.parameters.gui_flag,
+        # gui_flag=config.simulator.parameters.gui_flag,
+        gui_flag=True,
         realtime_flag=config.simulator.parameters.realtime_flag,
         output_path=base_dir,
-        sumo_output_file_types=["collision"],
-        traffic_scale=(
-            config.simulator.parameters.traffic_scale
-            if hasattr(config.simulator.parameters, "traffic_scale")
-            else 1
-        ),
+        sumo_output_file_types=["fcd_all"],
+        traffic_scale=config.simulator.parameters.traffic_scale if hasattr(config.simulator.parameters, "traffic_scale") else 1,
         additional_sumo_args=[
-            "--device.bluelight.explicit",
-            "true",
+            "--device.bluelight.explicit","true",
         ],
     )
     sim.bind_env(env)
@@ -83,7 +83,7 @@ if __name__ == "__main__":
     config_dir = Path(__file__).parent / "examples" / "scenarios"
     # yaml_files = sorted(config_dir.glob("*.yaml"), key=lambda x: int(''.join(filter(str.isdigit, x.stem)) or '0'))
     # yaml_files = ["examples/scenarios/cutin.yaml"]
-    yaml_files = [Path("/home/sdai/harry/TeraSim/jupiter/eb/test_config.yaml")]
+    yaml_files = [Path("examples/scenarios/Mcity_corner_case_generation.yaml")]
     # Randomly shuffle yaml files
     random.shuffle(yaml_files)
 
@@ -97,4 +97,4 @@ if __name__ == "__main__":
         # except Exception as e:
         #     logger.error(f"Error running {yaml_file}: {e}")
         #     # yaml_file.unlink()  # Delete the yaml file
-        # continue
+            # continue
