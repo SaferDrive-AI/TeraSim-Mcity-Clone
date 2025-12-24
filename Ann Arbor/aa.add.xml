@@ -1,6 +1,0 @@
-<additional>
-    <!-- Record lane data -->
-    <laneData id="dump_lane" file="lane_data.xml" period="300" excludeEmpty="true"/>
-    <!-- Record edge data -->
-    <edgeData id="dump_edge" file="edge_data.xml" period="300" excludeEmpty="true"/>
-</additional>
