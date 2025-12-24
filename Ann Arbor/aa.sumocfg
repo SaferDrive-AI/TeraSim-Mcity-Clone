@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<configuration>
+    <output>
+        <!-- <output-prefix value="../../sumo_outputs/"/>
+        <summary-output value="stats.xml"/> -->
+<!--        <tripinfo-output.write-unfinished value="true"/>-->
+<!--        <tripinfo-output.write-undeparted value="true"/>-->
+<!--        <tripinfo-output value="trips.xml"/>-->
+<!--        <vehroute-output value="routes.xml"/>-->
+<!--        <vehroute-output.route-length value="true"/>-->
+<!--        <vehroute-output.last-route value="true"/>-->
+<!--        <vehroute-output.write-unfinished value="true"/>-->
+<!--        <vehroute-output.exit-times value="true"/>-->
+    </output>
+
+    <input>
+        <net-file value="aa.net.xml"/>
+        <route-files value="aa.rou.xml"/>
+<!--        <route-files value="aa.rou.xml"/>-->
+<!--        <additional-files value="aa.add.xml"/>-->
+    </input>
+
+    <time>
+        <begin value="0"/>
+        <end value="86400"/>
+        <step-length value="1"/>
+    </time>
+
+    <random_number>
+        <random value="false"/>
+        <seed value="0"/>
+    </random_number>
+
+    <processing>
+        <scale value="1"/>
+        <ignore-route-errors value="true"/>
+        <time-to-teleport value="300"/>
+    </processing>
+
+    <mesoscopic>
+        <mesosim value="false"/>
+        <meso-edgelength value="50"/>
+        <meso-tauff value="1"/>
+        <meso-taufj value="1.2"/>
+        <meso-taujf value="1"/>
+        <meso-taujj value="1.2"/>
+        <meso-multi-queue value="true"/>
+        <meso-lane-queue value="true"/>
+        <meso-junction-control value="false"/>
+        <meso-tls-penalty value="0.5"/>
+        <meso-minor-penalty value="3"/>
+        <meso-overtaking value="true"/>
+    </mesoscopic>
+</configuration>
