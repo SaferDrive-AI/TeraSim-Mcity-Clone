@@ -349,6 +349,63 @@ def _update_lane_elements(edge_elem: ET.Element, new_lane_count: int) -> None:
             param.set('value', orig_id)
 
 
+def calculate_edge_angle(shape_str: str, at_end: bool = True) -> float:
+    """
+    Calculate the heading angle of an edge based on its shape.
+
+    Args:
+        shape_str: Shape string
+        at_end: If True, calculate angle at the end of the edge; otherwise at the start
+
+    Returns:
+        Angle in degrees (0-360, where 0 is East, 90 is North)
+    """
+    import math
+
+    if not shape_str:
+        return 0.0
+
+    coords = parse_shape_coordinates(shape_str)
+    if len(coords) < 2:
+        return 0.0
+
+    if at_end:
+        # Use last two points to determine heading at the end
+        x1, y1 = coords[-2]
+        x2, y2 = coords[-1]
+    else:
+        # Use first two points to determine heading at the start
+        x1, y1 = coords[0]
+        x2, y2 = coords[1]
+
+    angle = math.atan2(y2 - y1, x2 - x1)
+    return math.degrees(angle) % 360
+
+
+def determine_turn_direction(from_angle: float, to_angle: float) -> str:
+    """
+    Determine the turn direction based on incoming and outgoing angles.
+
+    Returns: 'r' (right), 's' (straight), 'l' (left), or 't' (u-turn)
+    """
+    # Calculate the turn angle
+    turn = (to_angle - from_angle) % 360
+
+    # Normalize to -180 to 180
+    if turn > 180:
+        turn -= 360
+
+    # Classify the turn
+    if -45 <= turn <= 45:
+        return 's'  # straight
+    elif 45 < turn <= 135:
+        return 'l'  # left
+    elif -135 <= turn < -45:
+        return 'r'  # right
+    else:
+        return 't'  # u-turn (turn around)
+
+
 def update_connections_for_center_lane(
     input_edge_file: str,
     input_con_file: str,
@@ -359,13 +416,10 @@ def update_connections_for_center_lane(
     """
     Update connections after adding center lane.
 
-    When we add a center lane (new lane index 1), we need to:
-    1. Shift existing lane 1 connections to lane 2
-    2. Add connections for the new center lane (lane 1)
-
-    The center lane should connect to:
-    - The reverse edge's center lane (for U-turns / through traffic)
-    - Optionally to other edges
+    When we add a center lane, we need to:
+    1. Shift existing lane indices to make room for the new lane
+    2. Assign left turns and U-turns to the new center lane (leftmost lane)
+    3. Remove left turns and U-turns from other lanes
 
     Args:
         input_edge_file: Path to edge XML file
@@ -418,7 +472,10 @@ def update_connections_for_center_lane(
     con_root = con_tree.getroot()
 
     modified_count = 0
-    new_connections = []
+
+    # First pass: analyze all connections and determine turn directions
+    # Collect connection info for each edge
+    edge_conn_info: Dict[str, List[Tuple[ET.Element, str, int, Optional[str], int]]] = {}
 
     for conn_elem in con_root.findall('connection'):
         from_edge = conn_elem.get('from')
@@ -427,53 +484,106 @@ def update_connections_for_center_lane(
         if from_edge is None or to_edge is None:
             continue
 
+        # Only process connections FROM modified edges
+        if from_edge not in modified_edges:
+            continue
+
         from_lane = int(conn_elem.get('fromLane', '0'))
         to_lane = int(conn_elem.get('toLane', '0'))
 
-        # Check if this connection involves a modified edge
-        from_modified = from_edge in modified_edges
-        to_modified = to_edge in modified_edges
+        # Get the edge info
+        if from_edge not in edge_map:
+            continue
 
-        if from_modified or to_modified:
-            # Shift lane indices for lanes >= 1 (to make room for center lane)
-            new_from_lane = from_lane
-            new_to_lane = to_lane
+        from_edge_info = edge_map[from_edge]
+        reverse_edge_id = edge_pairs.get(from_edge)
 
-            if from_modified and from_lane >= 1:
-                new_from_lane = from_lane + 1
+        # Determine the turn direction
+        turn_direction = None
 
-            if to_modified and to_lane >= 1:
-                new_to_lane = to_lane + 1
+        # Check if this is a U-turn to the reverse edge
+        if reverse_edge_id and to_edge == reverse_edge_id:
+            turn_direction = 't'
+        elif to_edge in edge_map:
+            to_edge_info = edge_map[to_edge]
+            from_angle = calculate_edge_angle(from_edge_info.shape, at_end=True)
+            to_angle = calculate_edge_angle(to_edge_info.shape, at_end=False)
+            turn_direction = determine_turn_direction(from_angle, to_angle)
 
-            if new_from_lane != from_lane or new_to_lane != to_lane:
-                logger.info(f"  Shifting connection: {from_edge}:{from_lane}->{to_edge}:{to_lane}")
-                logger.info(f"    -> {from_edge}:{new_from_lane}->{to_edge}:{new_to_lane}")
+        if from_edge not in edge_conn_info:
+            edge_conn_info[from_edge] = []
+        edge_conn_info[from_edge].append((conn_elem, to_edge, from_lane, turn_direction, to_lane))
 
-                if not dry_run:
-                    conn_elem.set('fromLane', str(new_from_lane))
-                    conn_elem.set('toLane', str(new_to_lane))
+    # Second pass: fix connections for each modified edge
+    for from_edge, conn_list in edge_conn_info.items():
+        from_edge_info = edge_map[from_edge]
+        num_lanes = from_edge_info.num_lanes  # Current number of lanes (before adding)
+        left_lane = num_lanes - 1  # Leftmost lane index (this is the center lane)
 
-                modified_count += 1
+        # For proper lane assignment:
+        # - Leftmost lane (index num_lanes-1): left turns + U-turns ONLY
+        # - Other lanes: straight + right (no left/U-turn)
 
-    # Add connections for the new center lane (lane 1)
+        logger.info(f"\n  Processing {from_edge} ({num_lanes} lanes, leftmost={left_lane}):")
+
+        for conn_elem, to_edge, from_lane, turn_direction, to_lane in conn_list:
+            dir_names: Dict[str, str] = {'r': 'right', 's': 'straight', 'l': 'left', 't': 'U-turn'}
+            dir_name = dir_names.get(turn_direction or '', 'unknown')
+
+            if turn_direction in ('l', 't'):
+                # Left turn or U-turn: should be on leftmost lane ONLY
+                if from_lane != left_lane:
+                    # Move to leftmost lane
+                    logger.info(f"    Moving {dir_name}: lane {from_lane} -> lane {left_lane} (to {to_edge})")
+                    if not dry_run:
+                        conn_elem.set('fromLane', str(left_lane))
+                    modified_count += 1
+                else:
+                    logger.info(f"    Keeping {dir_name}: lane {from_lane} (to {to_edge})")
+            elif turn_direction in ('r', 's'):
+                # Right or straight: should NOT be on leftmost lane
+                if from_lane == left_lane:
+                    # Move straight/right from leftmost lane to the next lane (left_lane - 1)
+                    new_lane = left_lane - 1 if left_lane > 0 else 0
+                    logger.info(f"    Moving {dir_name}: lane {from_lane} -> lane {new_lane} (to {to_edge})")
+                    if not dry_run:
+                        conn_elem.set('fromLane', str(new_lane))
+                    modified_count += 1
+                else:
+                    logger.info(f"    Keeping {dir_name}: lane {from_lane} (to {to_edge})")
+
+    # Add U-turn connections for the leftmost lane if not already present
     for edge_id in edge_ids:
         if edge_id not in edge_pairs:
             continue
 
         reverse_id = edge_pairs[edge_id]
+        edge_info = edge_map.get(edge_id)
+        if not edge_info:
+            continue
 
-        # Add connection from edge's center lane to reverse edge's center lane
-        # This allows bidirectional use
-        logger.info(f"  Adding center lane connection: {edge_id}:1 -> {reverse_id}:1")
+        left_lane = edge_info.num_lanes - 1
 
-        if not dry_run:
-            new_conn = ET.SubElement(con_root, 'connection')
-            new_conn.set('from', edge_id)
-            new_conn.set('to', reverse_id)
-            new_conn.set('fromLane', '1')
-            new_conn.set('toLane', '1')
+        # Check if U-turn connection already exists from left lane
+        uturn_exists = False
+        for conn_elem in con_root.findall('connection'):
+            if (conn_elem.get('from') == edge_id and
+                conn_elem.get('to') == reverse_id and
+                int(conn_elem.get('fromLane', '0')) == left_lane):
+                uturn_exists = True
+                break
 
-        modified_count += 1
+        if not uturn_exists:
+            logger.info(f"  Adding U-turn connection: {edge_id}:{left_lane} -> {reverse_id}:{left_lane}")
+
+            if not dry_run:
+                new_conn = ET.SubElement(con_root, 'connection')
+                new_conn.set('from', edge_id)
+                new_conn.set('to', reverse_id)
+                new_conn.set('fromLane', str(left_lane))
+                new_conn.set('toLane', str(left_lane))
+
+            modified_count += 1
 
     if not dry_run and modified_count > 0:
         logger.info(f"\nWriting modified connection file: {output_con_file}")
