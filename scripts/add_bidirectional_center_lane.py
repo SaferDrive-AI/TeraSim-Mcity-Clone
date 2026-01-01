@@ -88,7 +88,10 @@ def coords_to_shape(coords: List[Tuple[float, float]]) -> str:
 
 def offset_shape(shape_str: str, offset_distance: float, direction: str = 'right') -> str:
     """
-    Offset a shape perpendicular to its direction.
+    Offset a shape perpendicular to its overall direction.
+
+    Uses a single consistent offset vector based on the overall edge direction
+    (from start to end point) to preserve the original shape geometry.
 
     Args:
         shape_str: Original shape string
@@ -104,59 +107,35 @@ def offset_shape(shape_str: str, offset_distance: float, direction: str = 'right
     if len(coords) < 2:
         return shape_str
 
+    # Calculate overall direction from start to end point
+    start_x, start_y = coords[0]
+    end_x, end_y = coords[-1]
+    dx = end_x - start_x
+    dy = end_y - start_y
+
+    # Normalize direction vector
+    length = math.sqrt(dx * dx + dy * dy)
+    if length > 0:
+        dx /= length
+        dy /= length
+    else:
+        dx, dy = 1, 0
+
+    # Calculate perpendicular vector (rotate 90 degrees)
+    # For 'right': rotate clockwise (-90 degrees): (dx, dy) -> (dy, -dx)
+    # For 'left': rotate counter-clockwise (+90 degrees): (dx, dy) -> (-dy, dx)
+    if direction == 'right':
+        perp_x = dy
+        perp_y = -dx
+    else:  # left
+        perp_x = -dy
+        perp_y = dx
+
+    # Apply the same offset to all points to preserve shape
     offset_coords = []
-
-    for i in range(len(coords)):
-        x, y = coords[i]
-
-        # Calculate the direction vector at this point
-        if i == 0:
-            # First point: use direction to next point
-            dx = coords[i + 1][0] - x
-            dy = coords[i + 1][1] - y
-        elif i == len(coords) - 1:
-            # Last point: use direction from previous point
-            dx = x - coords[i - 1][0]
-            dy = y - coords[i - 1][1]
-        else:
-            # Middle points: average of incoming and outgoing directions
-            dx1 = x - coords[i - 1][0]
-            dy1 = y - coords[i - 1][1]
-            dx2 = coords[i + 1][0] - x
-            dy2 = coords[i + 1][1] - y
-            # Normalize and average
-            len1 = math.sqrt(dx1 * dx1 + dy1 * dy1)
-            len2 = math.sqrt(dx2 * dx2 + dy2 * dy2)
-            if len1 > 0 and len2 > 0:
-                dx = (dx1 / len1 + dx2 / len2) / 2
-                dy = (dy1 / len1 + dy2 / len2) / 2
-            elif len1 > 0:
-                dx, dy = dx1 / len1, dy1 / len1
-            elif len2 > 0:
-                dx, dy = dx2 / len2, dy2 / len2
-            else:
-                dx, dy = 1, 0
-
-        # Normalize direction vector
-        length = math.sqrt(dx * dx + dy * dy)
-        if length > 0:
-            dx /= length
-            dy /= length
-
-        # Calculate perpendicular vector (rotate 90 degrees)
-        # For 'right': rotate clockwise (-90 degrees): (dx, dy) -> (dy, -dx)
-        # For 'left': rotate counter-clockwise (+90 degrees): (dx, dy) -> (-dy, dx)
-        if direction == 'right':
-            perp_x = dy
-            perp_y = -dx
-        else:  # left
-            perp_x = -dy
-            perp_y = dx
-
-        # Apply offset
+    for x, y in coords:
         new_x = x + perp_x * offset_distance
         new_y = y + perp_y * offset_distance
-
         offset_coords.append((new_x, new_y))
 
     return coords_to_shape(offset_coords)
@@ -298,15 +277,13 @@ def add_center_lane_to_edges(
             if not original_reverse_shape and original_shape:
                 original_reverse_shape = reverse_shape(original_shape)
 
-            # Make the reverse edge shape exactly reversed from the forward edge
-            reversed_shape_str = reverse_shape(original_shape)
-
             # Offset edge 1 to the RIGHT (shifts lanes toward right side of road)
             offset_shape_1 = offset_shape(original_shape, offset_distance, direction='right')
 
             # Offset edge 2 to the RIGHT (relative to its direction)
-            # Since it goes opposite direction, this also shifts its lanes toward the outside
-            offset_shape_2 = offset_shape(reversed_shape_str, offset_distance, direction='right')
+            # IMPORTANT: Use the actual reverse edge's shape, not a reversed copy of forward edge
+            # This preserves the correct endpoint positions for each edge
+            offset_shape_2 = offset_shape(original_reverse_shape, offset_distance, direction='right')
 
             logger.info(f"  Original shape (edge 1): {original_shape[:50]}...")
             logger.info(f"  Offset shape (edge 1):   {offset_shape_1[:50]}...")
