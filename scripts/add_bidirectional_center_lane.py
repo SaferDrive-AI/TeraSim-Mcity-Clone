@@ -250,21 +250,21 @@ def add_center_lane_to_edges(
 
         # Calculate offset to make only the center (leftmost) lane overlap
         # With spreadType="center", lanes spread equally on both sides of the shape
-        # For n lanes: lanes 0 to (n/2-1) are on right, lanes (n/2) to (n-1) are on left
-        # The leftmost lane (index n-1) should overlap between the two edges
         #
-        # Original: 3 lanes each, shapes overlap -> all 3 lanes overlap (wrong)
-        # We want: 4 lanes each, only lane 3 (leftmost) overlaps
+        # For N lanes with width W, the leftmost lane (index N-1) center is at:
+        #   position = (N - 1) / 2 * W  (to the left of shape centerline)
         #
-        # With 4 lanes and spreadType="center":
-        #   - Total width = 4 * lane_width = 12.8m
-        #   - Lanes spread 6.4m on each side of shape
-        #   - Lane 3 (leftmost) center is at: 1.5 * lane_width from shape = 4.8m left
+        # After adding 1 lane (N+1 total), the new leftmost lane center is at:
+        #   position = N / 2 * W
         #
-        # To make lane 3 from both edges overlap at the same position:
-        #   - We need to offset each edge to the RIGHT by half a lane width
-        #   - This shifts all lanes right, moving the leftmost lane toward center
-        offset_distance = lane_width
+        # To make the leftmost lanes of both edges overlap at the road center,
+        # we offset each edge to the RIGHT by: ((N - 1) / 2) * W
+        # Each edge shifts, bringing them one lane closer together.
+        #
+        # Example: 3 lanes -> 4 lanes, W = 3.2m
+        #   offset = ((3 - 1) / 2) * 3.2 = 3.2m
+        #   Each edge shifts right 3.2m, their leftmost lanes now overlap at center
+        offset_distance = ((edge.num_lanes - 2) / 2) * lane_width
 
         logger.info(f"  Offset distance: {offset_distance:.2f}m (to overlap only center lane)")
 
