@@ -158,12 +158,81 @@ def find_reverse_edge(edge_id: str, edge_map: Dict[str, EdgeInfo]) -> Optional[E
     return None
 
 
+def shift_specified_edges(
+    edge_map: Dict[str, EdgeInfo],
+    edges_up: List[str],
+    edges_down: List[str],
+    shift_distance: float,
+    dry_run: bool = False
+) -> int:
+    """
+    Shift specified edges up or down by half lane width.
+
+    Both the edge and its reverse are shifted in the same absolute direction
+    (perpendicular to the road), keeping them together as a pair.
+
+    Args:
+        edge_map: Dictionary of edge ID to EdgeInfo
+        edges_up: List of edge IDs to shift UP
+        edges_down: List of edge IDs to shift DOWN
+        shift_distance: Distance to shift (typically lane_width / 2)
+        dry_run: If True, only report changes
+
+    Returns:
+        Number of edges shifted
+    """
+    shifted_count = 0
+
+    # Helper to shift an edge pair in the same absolute direction
+    def shift_edge_pair(edge_id: str, shift_up: bool) -> int:
+        if edge_id not in edge_map:
+            logger.warning(f"Edge not found: {edge_id}")
+            return 0
+
+        edge = edge_map[edge_id]
+        reverse_edge = find_reverse_edge(edge_id, edge_map)
+
+        dir_name = "UP" if shift_up else "DOWN"
+        logger.info(f"    Shifting {dir_name}: {edge.id}" + (f" & {reverse_edge.id}" if reverse_edge else ""))
+
+        count = 0
+        if not dry_run:
+            # For the primary edge: shift right if UP, left if DOWN
+            primary_direction = 'right' if shift_up else 'left'
+            edge.element.set('shape', offset_shape(edge.shape, shift_distance, direction=primary_direction))
+            count += 1
+
+            if reverse_edge:
+                # For the reverse edge: shift in OPPOSITE direction relative to its own direction
+                # This keeps both edges moving together in the same absolute direction
+                reverse_direction = 'left' if shift_up else 'right'
+                reverse_edge.element.set('shape', offset_shape(reverse_edge.shape, shift_distance, direction=reverse_direction))
+                count += 1
+
+        return count if not dry_run else (2 if reverse_edge else 1)
+
+    if edges_up or edges_down:
+        logger.info(f"\nShifting specified edges:")
+
+    # Shift edges UP
+    for edge_id in edges_up:
+        shifted_count += shift_edge_pair(edge_id, shift_up=True)
+
+    # Shift edges DOWN
+    for edge_id in edges_down:
+        shifted_count += shift_edge_pair(edge_id, shift_up=False)
+
+    return shifted_count
+
+
 def add_center_lane_to_edges(
     input_edge_file: str,
     output_edge_file: str,
     edge_ids: List[str],
     dry_run: bool = False,
-    lane_width: float = 3.2
+    lane_width: float = 3.2,
+    edges_shift_up: Optional[List[str]] = None,
+    edges_shift_down: Optional[List[str]] = None
 ) -> int:
     """
     Add a bidirectional center lane to specified edge pairs.
@@ -310,6 +379,17 @@ def add_center_lane_to_edges(
         processed.add(reverse_edge.id)
         modified_count += 1
 
+    # Shift connected edges if manually specified
+    if (edges_shift_up or edges_shift_down) and modified_count > 0:
+        shift_distance = lane_width / 2  # Half lane width
+        shift_specified_edges(
+            edge_map,
+            edges_shift_up or [],
+            edges_shift_down or [],
+            shift_distance,
+            dry_run
+        )
+
     if not dry_run and modified_count > 0:
         logger.info(f"\nWriting modified edge file: {output_edge_file}")
         ET.indent(tree, space="    ")
@@ -411,7 +491,8 @@ def update_connections_for_center_lane(
     input_con_file: str,
     output_con_file: str,
     edge_ids: List[str],
-    dry_run: bool = False
+    dry_run: bool = False,
+    skip_updates: bool = False
 ) -> int:
     """
     Update connections after adding center lane.
@@ -427,10 +508,15 @@ def update_connections_for_center_lane(
         output_con_file: Path to output connection XML file
         edge_ids: List of edge IDs that were modified
         dry_run: If True, only report changes
+        skip_updates: If True, don't modify connections at all
 
     Returns:
         Number of connections modified
     """
+    if skip_updates:
+        logger.info("\nSkipping connection updates (--skip-connection-updates specified)")
+        return 0
+
     logger.info(f"\nReading edge file: {input_edge_file}")
     logger.info(f"Reading connection file: {input_con_file}")
 
@@ -605,9 +691,17 @@ Examples:
   python add_bidirectional_center_lane.py Ann_Arbor/aa_plain.edg.xml \\
       --edges "23481137010#0" --dry-run
 
+  # Add center lane with manual edge shifting
+  # For edge 8974919201#0: shift 8974919180#0/8974919181#0 pair UP
+  #                        shift 4126464930#0/4126464931#0 pair DOWN
+  python add_bidirectional_center_lane.py Ann_Arbor/aa_plain.edg.xml \\
+      --edges "8974919201#0" \\
+      --shift-up "8974919180#0" \\
+      --shift-down "4126464930#0"
+
   # Add center lane and update connections
   python add_bidirectional_center_lane.py Ann_Arbor/aa_plain.edg.xml \\
-      --edges "23481137010#0" --update-connections
+      --edges "23481137010#0" --update-connections --modify-connections
 
   # Specify output files
   python add_bidirectional_center_lane.py Ann_Arbor/aa_plain.edg.xml \\
@@ -665,10 +759,38 @@ Road Configuration:
     )
 
     parser.add_argument(
+        '--skip-connection-updates',
+        action='store_true',
+        default=True,
+        help='Skip updating connection lane assignments (default: True, only update edge file)'
+    )
+
+    parser.add_argument(
+        '--modify-connections',
+        action='store_false',
+        dest='skip_connection_updates',
+        help='Enable connection lane assignment modifications (overrides --skip-connection-updates)'
+    )
+
+    parser.add_argument(
         '--lane-width',
         type=float,
         default=3.2,
         help='Width of the center lane in meters (default: 3.2m)'
+    )
+
+    parser.add_argument(
+        '--shift-up',
+        nargs='+',
+        default=None,
+        help='Edge IDs to shift UP (e.g., incoming edges at junction)'
+    )
+
+    parser.add_argument(
+        '--shift-down',
+        nargs='+',
+        default=None,
+        help='Edge IDs to shift DOWN (e.g., outgoing edges at junction)'
     )
 
     parser.add_argument(
@@ -701,7 +823,9 @@ Road Configuration:
             output_edge_file=output_edge_file,
             edge_ids=args.edges,
             dry_run=args.dry_run,
-            lane_width=args.lane_width
+            lane_width=args.lane_width,
+            edges_shift_up=args.shift_up,
+            edges_shift_down=args.shift_down
         )
 
         # Update connections if requested
@@ -721,7 +845,8 @@ Road Configuration:
                 input_con_file=con_file,
                 output_con_file=con_output,
                 edge_ids=args.edges,
-                dry_run=args.dry_run
+                dry_run=args.dry_run,
+                skip_updates=args.skip_connection_updates
             )
 
         if modified > 0 and not args.dry_run:
