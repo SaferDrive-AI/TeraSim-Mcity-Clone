@@ -231,6 +231,126 @@ def shift_specified_edges(
     return shifted_count
 
 
+def shift_nodes_for_edges(
+    node_file: str,
+    output_node_file: str,
+    edge_map: Dict[str, EdgeInfo],
+    edges_up: List[str],
+    edges_down: List[str],
+    shift_distance: float,
+    dry_run: bool = False
+) -> int:
+    """
+    Shift nodes that connect shifted edges to avoid curved junctions.
+
+    When edges are shifted, the nodes at their endpoints need to be shifted too,
+    otherwise SUMO will create curved connections to match the original node positions.
+
+    For each shifted edge pair, we shift the shared endpoint nodes in the same direction.
+
+    Args:
+        node_file: Path to input node XML file
+        output_node_file: Path to output node XML file
+        edge_map: Dictionary of edge ID to EdgeInfo
+        edges_up: List of edge IDs shifted UP
+        edges_down: List of edge IDs shifted DOWN
+        shift_distance: Distance shifted (typically lane_width / 2)
+        dry_run: If True, only report changes
+
+    Returns:
+        Number of nodes shifted
+    """
+    logger.info(f"\nReading node file: {node_file}")
+
+    tree = ET.parse(node_file)
+    root = tree.getroot()
+
+    # Build node map
+    node_map: Dict[str, ET.Element] = {}
+    for node_elem in root.findall('node'):
+        node_id = node_elem.get('id')
+        if node_id:
+            node_map[node_id] = node_elem
+
+    # Collect nodes that need shifting and their direction
+    # A node should be shifted if ALL edges connected to it (from the shifted set) go the same direction
+    nodes_to_shift_up: Set[str] = set()
+    nodes_to_shift_down: Set[str] = set()
+
+    def collect_nodes_for_edge(edge_id: str, shift_up: bool):
+        if edge_id not in edge_map:
+            return
+        edge = edge_map[edge_id]
+        reverse_edge = find_reverse_edge(edge_id, edge_map)
+
+        # Get all nodes for this edge pair
+        nodes = {edge.from_node, edge.to_node}
+        if reverse_edge:
+            nodes.add(reverse_edge.from_node)
+            nodes.add(reverse_edge.to_node)
+
+        if shift_up:
+            nodes_to_shift_up.update(nodes)
+        else:
+            nodes_to_shift_down.update(nodes)
+
+    for edge_id in edges_up:
+        collect_nodes_for_edge(edge_id, shift_up=True)
+
+    for edge_id in edges_down:
+        collect_nodes_for_edge(edge_id, shift_up=False)
+
+    # Remove nodes that appear in both (conflicting shifts) - don't shift these
+    conflicting_nodes = nodes_to_shift_up & nodes_to_shift_down
+    if conflicting_nodes:
+        logger.warning(f"  Nodes with conflicting shift directions (not shifted): {conflicting_nodes}")
+        nodes_to_shift_up -= conflicting_nodes
+        nodes_to_shift_down -= conflicting_nodes
+
+    shifted_count = 0
+
+    # Shift nodes UP
+    for node_id in nodes_to_shift_up:
+        if node_id not in node_map:
+            logger.warning(f"  Node not found: {node_id}")
+            continue
+
+        node_elem = node_map[node_id]
+        y = float(node_elem.get('y', '0'))
+        new_y = y + shift_distance
+
+        logger.info(f"    Shifting node {node_id} UP: y={y:.2f} -> y={new_y:.2f}")
+
+        if not dry_run:
+            node_elem.set('y', f"{new_y:.2f}")
+        shifted_count += 1
+
+    # Shift nodes DOWN
+    for node_id in nodes_to_shift_down:
+        if node_id not in node_map:
+            logger.warning(f"  Node not found: {node_id}")
+            continue
+
+        node_elem = node_map[node_id]
+        y = float(node_elem.get('y', '0'))
+        new_y = y - shift_distance
+
+        logger.info(f"    Shifting node {node_id} DOWN: y={y:.2f} -> y={new_y:.2f}")
+
+        if not dry_run:
+            node_elem.set('y', f"{new_y:.2f}")
+        shifted_count += 1
+
+    if not dry_run and shifted_count > 0:
+        logger.info(f"\nWriting modified node file: {output_node_file}")
+        ET.indent(tree, space="    ")
+        tree.write(output_node_file, encoding='UTF-8', xml_declaration=True)
+
+    logger.info(f"\n{'[DRY RUN] ' if dry_run else ''}Shifted {shifted_count} nodes")
+
+    return shifted_count
+
+
 def add_center_lane_to_edges(
     input_edge_file: str,
     output_edge_file: str,
@@ -238,7 +358,9 @@ def add_center_lane_to_edges(
     dry_run: bool = False,
     lane_width: float = 3.2,
     edges_shift_up: Optional[List[str]] = None,
-    edges_shift_down: Optional[List[str]] = None
+    edges_shift_down: Optional[List[str]] = None,
+    node_file: Optional[str] = None,
+    output_node_file: Optional[str] = None
 ) -> int:
     """
     Add a bidirectional center lane to specified edge pairs.
@@ -395,6 +517,19 @@ def add_center_lane_to_edges(
             shift_distance,
             dry_run
         )
+
+        # Also shift nodes if node file is provided
+        if node_file:
+            actual_output_node_file = output_node_file or node_file
+            shift_nodes_for_edges(
+                node_file,
+                actual_output_node_file,
+                edge_map,
+                edges_shift_up or [],
+                edges_shift_down or [],
+                shift_distance,
+                dry_run
+            )
 
     if not dry_run and modified_count > 0:
         logger.info(f"\nWriting modified edge file: {output_edge_file}")
@@ -800,6 +935,18 @@ Road Configuration:
     )
 
     parser.add_argument(
+        '--node-file',
+        help='Node XML file to update when shifting edges (default: inferred from edge file)',
+        default=None
+    )
+
+    parser.add_argument(
+        '--node-output',
+        help='Output node XML file (default: overwrites input node file)',
+        default=None
+    )
+
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='Show what would be changed without modifying files'
@@ -822,6 +969,16 @@ Road Configuration:
 
     output_edge_file = args.output if args.output else args.input_edge_file
 
+    # Determine node file (default: infer from edge file)
+    node_file = args.node_file
+    if not node_file and (args.shift_up or args.shift_down):
+        node_file = args.input_edge_file.replace('.edg.xml', '.nod.xml')
+        if not os.path.exists(node_file):
+            logger.warning(f"Node file not found: {node_file} - nodes will not be shifted")
+            node_file = None
+
+    node_output = args.node_output if args.node_output else node_file
+
     try:
         # Add center lane to edges
         modified = add_center_lane_to_edges(
@@ -831,7 +988,9 @@ Road Configuration:
             dry_run=args.dry_run,
             lane_width=args.lane_width,
             edges_shift_up=args.shift_up,
-            edges_shift_down=args.shift_down
+            edges_shift_down=args.shift_down,
+            node_file=node_file,
+            output_node_file=node_output
         )
 
         # Update connections if requested
