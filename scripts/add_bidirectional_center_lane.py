@@ -197,15 +197,21 @@ def shift_specified_edges(
 
         count = 0
         if not dry_run:
-            # For the primary edge: shift right if UP, left if DOWN
-            primary_direction = 'right' if shift_up else 'left'
+            # For the primary edge: shift left if UP (increase Y), right if DOWN (decrease Y)
+            # This is because for an east-going edge:
+            #   - 'left' (counter-clockwise 90°) = positive Y direction (UP)
+            #   - 'right' (clockwise 90°) = negative Y direction (DOWN)
+            primary_direction = 'left' if shift_up else 'right'
             edge.element.set('shape', offset_shape(edge.shape, shift_distance, direction=primary_direction))
             count += 1
 
             if reverse_edge:
-                # For the reverse edge: shift in OPPOSITE direction relative to its own direction
-                # This keeps both edges moving together in the same absolute direction
-                reverse_direction = 'left' if shift_up else 'right'
+                # For the reverse edge (going opposite direction): use OPPOSITE relative direction
+                # Because for a west-going edge (opposite to east-going):
+                #   - 'left' = negative Y (DOWN) - opposite of east-going
+                #   - 'right' = positive Y (UP) - opposite of east-going
+                # So to move both edges in the same absolute direction, reverse edge uses opposite relative direction
+                reverse_direction = 'right' if shift_up else 'left'
                 reverse_edge.element.set('shape', offset_shape(reverse_edge.shape, shift_distance, direction=reverse_direction))
                 count += 1
 
