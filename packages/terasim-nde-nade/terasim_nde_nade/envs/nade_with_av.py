@@ -528,7 +528,7 @@ class NADEWithAV(NADE):
             tuple: Tuple containing the control commands, updated command information, weight, future trajectory, maneuver challenge, and criticality.
         """
         predicted_AV_control_command = self.predict_av_control_command(env_observation)
-        if env_command_information[AgentType.VEHICLE][AV_ID] is None:
+        if AV_ID not in env_command_information[AgentType.VEHICLE] or env_command_information[AgentType.VEHICLE][AV_ID] is None:
             env_command_information[AgentType.VEHICLE][AV_ID] = Dict()
         if predicted_AV_control_command is not None:
             env_command_information[AgentType.VEHICLE][AV_ID]["ndd_command_distribution"] = Dict(
@@ -544,7 +544,7 @@ class NADEWithAV(NADE):
                     "normal": NDECommand(command_type=CommandType.DEFAULT, prob=1),
                 }
             )
-        AV_command_cache = copy.deepcopy(env_command_information[AgentType.VEHICLE][AV_ID]["command_cache"])
+        AV_command_cache = copy.deepcopy(env_command_information[AgentType.VEHICLE][AV_ID].get("command_cache"))
 
         # filter the env_command_information and env_observation by the control radius from AV
         distance_from_AV = calclulate_distance_from_centered_agent(
@@ -596,8 +596,8 @@ class NADEWithAV(NADE):
             env_command_information (dict): Command information from the environment.
             env_observation (dict): Observation from the environment.
         """
-        if AV_ID in traci.vehicle.getIDList():
-            AV_control_command_cache = env_command_information[AgentType.VEHICLE][AV_ID]["command_cache"]
+        if AV_ID in traci.vehicle.getIDList() and AV_ID in env_command_information[AgentType.VEHICLE]:
+            AV_control_command_cache = env_command_information[AgentType.VEHICLE][AV_ID].get("command_cache")
             (
                 nade_control_commands,
                 env_command_information,
