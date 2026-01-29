@@ -1,1 +1,0 @@
-python scripts/add_bidirectional_center_lane.py san_jose/osm.edg.xml     --edges="-517627277"     --shift-down="-1418903639#0"  --shift-down="-157782383"   --shift-up="-416901218#1"     --lane-width 3.2

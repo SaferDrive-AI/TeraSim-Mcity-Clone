@@ -170,6 +170,43 @@ def load_node_coordinates(node_file: str) -> Dict[str, Tuple[float, float]]:
     return node_coords
 
 
+def calculate_edge_direction(shape_str: str) -> Tuple[float, float]:
+    """
+    Calculate the normalized direction vector of an edge based on its shape.
+
+    Args:
+        shape_str: Shape string of the edge
+
+    Returns:
+        Tuple (dx, dy) representing the normalized direction vector.
+        Returns (1, 0) if shape is invalid.
+    """
+    import math
+
+    if not shape_str:
+        return (1.0, 0.0)
+
+    coords = parse_shape_coordinates(shape_str)
+    if len(coords) < 2:
+        return (1.0, 0.0)
+
+    # Calculate direction from start to end
+    start_x, start_y = coords[0]
+    end_x, end_y = coords[-1]
+    dx = end_x - start_x
+    dy = end_y - start_y
+
+    # Normalize
+    length = math.sqrt(dx * dx + dy * dy)
+    if length > 0:
+        dx /= length
+        dy /= length
+    else:
+        dx, dy = 1.0, 0.0
+
+    return (dx, dy)
+
+
 def derive_shape_from_nodes(
     from_node: str,
     to_node: str,
@@ -443,19 +480,31 @@ def shift_specific_nodes(
     nodes_left: List[str],
     nodes_right: List[str],
     shift_distance: float,
+    edge_map: Optional[Dict[str, EdgeInfo]] = None,
     dry_run: bool = False
 ) -> int:
     """
-    Shift specific nodes in any direction by a given distance.
+    Shift specific nodes relative to their reference edge direction.
+
+    Each node specification can be either:
+    - "NODE_ID" - shifts in absolute X/Y direction (legacy mode)
+    - "NODE_ID:EDGE_ID" - shifts relative to the edge direction
+
+    For edge-relative shifting:
+    - up: perpendicular to edge, LEFT of edge direction (counter-clockwise 90°)
+    - down: perpendicular to edge, RIGHT of edge direction (clockwise 90°)
+    - left: parallel to edge, OPPOSITE to edge direction (backwards)
+    - right: parallel to edge, SAME as edge direction (forwards)
 
     Args:
         node_file: Path to input node XML file
         output_node_file: Path to output node XML file
-        nodes_up: List of node IDs to shift UP (increase Y)
-        nodes_down: List of node IDs to shift DOWN (decrease Y)
-        nodes_left: List of node IDs to shift LEFT (decrease X)
-        nodes_right: List of node IDs to shift RIGHT (increase X)
+        nodes_up: List of "NODE_ID" or "NODE_ID:EDGE_ID" to shift UP/perpendicular-left
+        nodes_down: List of "NODE_ID" or "NODE_ID:EDGE_ID" to shift DOWN/perpendicular-right
+        nodes_left: List of "NODE_ID" or "NODE_ID:EDGE_ID" to shift LEFT/parallel-backwards
+        nodes_right: List of "NODE_ID" or "NODE_ID:EDGE_ID" to shift RIGHT/parallel-forwards
         shift_distance: Distance to shift in meters
+        edge_map: Optional dictionary of edge ID to EdgeInfo (required for edge-relative shifting)
         dry_run: If True, only report changes
 
     Returns:
@@ -476,77 +525,119 @@ def shift_specific_nodes(
 
     shifted_count = 0
 
-    # Shift nodes UP (increase Y)
+    def parse_node_spec(spec: str) -> Tuple[str, Optional[str]]:
+        """Parse 'NODE_ID' or 'NODE_ID:EDGE_ID' format."""
+        if ':' in spec:
+            parts = spec.split(':', 1)
+            return parts[0], parts[1]
+        return spec, None
+
+    def get_edge_direction(edge_id: str) -> Tuple[float, float]:
+        """Get normalized direction vector for an edge."""
+        if not edge_map or edge_id not in edge_map:
+            logger.warning(f"  Edge not found: {edge_id} - using default direction (1, 0)")
+            return (1.0, 0.0)
+        edge = edge_map[edge_id]
+        if not edge.shape:
+            logger.warning(f"  Edge {edge_id} has no shape - using default direction (1, 0)")
+            return (1.0, 0.0)
+        return calculate_edge_direction(edge.shape)
+
+    def shift_node(node_id: str, edge_id: Optional[str], direction: str) -> bool:
+        """
+        Shift a single node.
+
+        direction: 'up', 'down', 'left', 'right'
+        """
+        if node_id not in node_map:
+            logger.warning(f"  Node not found: {node_id}")
+            return False
+
+        node_elem = node_map[node_id]
+        x = float(node_elem.get('x', '0'))
+        y = float(node_elem.get('y', '0'))
+
+        if edge_id:
+            # Edge-relative shifting
+            dx, dy = get_edge_direction(edge_id)
+
+            if direction == 'up':
+                # Perpendicular left (counter-clockwise 90°): (dx, dy) -> (-dy, dx)
+                shift_x = -dy * shift_distance
+                shift_y = dx * shift_distance
+                dir_desc = f"perpendicular-left relative to {edge_id}"
+            elif direction == 'down':
+                # Perpendicular right (clockwise 90°): (dx, dy) -> (dy, -dx)
+                shift_x = dy * shift_distance
+                shift_y = -dx * shift_distance
+                dir_desc = f"perpendicular-right relative to {edge_id}"
+            elif direction == 'left':
+                # Parallel backwards (opposite direction): (dx, dy) -> (-dx, -dy)
+                shift_x = -dx * shift_distance
+                shift_y = -dy * shift_distance
+                dir_desc = f"parallel-backwards relative to {edge_id}"
+            else:  # right
+                # Parallel forwards (same direction): (dx, dy)
+                shift_x = dx * shift_distance
+                shift_y = dy * shift_distance
+                dir_desc = f"parallel-forwards relative to {edge_id}"
+        else:
+            # Absolute X/Y shifting (legacy mode)
+            if direction == 'up':
+                shift_x, shift_y = 0, shift_distance
+                dir_desc = "absolute UP (+Y)"
+            elif direction == 'down':
+                shift_x, shift_y = 0, -shift_distance
+                dir_desc = "absolute DOWN (-Y)"
+            elif direction == 'left':
+                shift_x, shift_y = -shift_distance, 0
+                dir_desc = "absolute LEFT (-X)"
+            else:  # right
+                shift_x, shift_y = shift_distance, 0
+                dir_desc = "absolute RIGHT (+X)"
+
+        new_x = x + shift_x
+        new_y = y + shift_y
+
+        logger.info(f"    {node_id}: ({x:.2f}, {y:.2f}) -> ({new_x:.2f}, {new_y:.2f}) [{dir_desc}]")
+
+        if not dry_run:
+            node_elem.set('x', f"{new_x:.2f}")
+            node_elem.set('y', f"{new_y:.2f}")
+
+        return True
+
+    # Shift nodes UP (perpendicular-left if edge specified)
     if nodes_up:
-        logger.info(f"\nShifting nodes UP:")
-    for node_id in nodes_up:
-        if node_id not in node_map:
-            logger.warning(f"  Node not found: {node_id}")
-            continue
+        logger.info(f"\nShifting nodes UP (perpendicular-left):")
+    for spec in nodes_up:
+        node_id, edge_id = parse_node_spec(spec)
+        if shift_node(node_id, edge_id, 'up'):
+            shifted_count += 1
 
-        node_elem = node_map[node_id]
-        y = float(node_elem.get('y', '0'))
-        new_y = y + shift_distance
-
-        logger.info(f"    {node_id}: y={y:.2f} -> y={new_y:.2f}")
-
-        if not dry_run:
-            node_elem.set('y', f"{new_y:.2f}")
-        shifted_count += 1
-
-    # Shift nodes DOWN (decrease Y)
+    # Shift nodes DOWN (perpendicular-right if edge specified)
     if nodes_down:
-        logger.info(f"\nShifting nodes DOWN:")
-    for node_id in nodes_down:
-        if node_id not in node_map:
-            logger.warning(f"  Node not found: {node_id}")
-            continue
+        logger.info(f"\nShifting nodes DOWN (perpendicular-right):")
+    for spec in nodes_down:
+        node_id, edge_id = parse_node_spec(spec)
+        if shift_node(node_id, edge_id, 'down'):
+            shifted_count += 1
 
-        node_elem = node_map[node_id]
-        y = float(node_elem.get('y', '0'))
-        new_y = y - shift_distance
-
-        logger.info(f"    {node_id}: y={y:.2f} -> y={new_y:.2f}")
-
-        if not dry_run:
-            node_elem.set('y', f"{new_y:.2f}")
-        shifted_count += 1
-
-    # Shift nodes LEFT (decrease X)
+    # Shift nodes LEFT (parallel-backwards if edge specified)
     if nodes_left:
-        logger.info(f"\nShifting nodes LEFT:")
-    for node_id in nodes_left:
-        if node_id not in node_map:
-            logger.warning(f"  Node not found: {node_id}")
-            continue
+        logger.info(f"\nShifting nodes LEFT (parallel-backwards):")
+    for spec in nodes_left:
+        node_id, edge_id = parse_node_spec(spec)
+        if shift_node(node_id, edge_id, 'left'):
+            shifted_count += 1
 
-        node_elem = node_map[node_id]
-        x = float(node_elem.get('x', '0'))
-        new_x = x - shift_distance
-
-        logger.info(f"    {node_id}: x={x:.2f} -> x={new_x:.2f}")
-
-        if not dry_run:
-            node_elem.set('x', f"{new_x:.2f}")
-        shifted_count += 1
-
-    # Shift nodes RIGHT (increase X)
+    # Shift nodes RIGHT (parallel-forwards if edge specified)
     if nodes_right:
-        logger.info(f"\nShifting nodes RIGHT:")
-    for node_id in nodes_right:
-        if node_id not in node_map:
-            logger.warning(f"  Node not found: {node_id}")
-            continue
-
-        node_elem = node_map[node_id]
-        x = float(node_elem.get('x', '0'))
-        new_x = x + shift_distance
-
-        logger.info(f"    {node_id}: x={x:.2f} -> x={new_x:.2f}")
-
-        if not dry_run:
-            node_elem.set('x', f"{new_x:.2f}")
-        shifted_count += 1
+        logger.info(f"\nShifting nodes RIGHT (parallel-forwards):")
+    for spec in nodes_right:
+        node_id, edge_id = parse_node_spec(spec)
+        if shift_node(node_id, edge_id, 'right'):
+            shifted_count += 1
 
     if not dry_run and shifted_count > 0:
         logger.info(f"\nWriting modified node file: {output_node_file}")
@@ -847,20 +938,27 @@ def add_center_lane_to_edges(
         # Calculate offset to make only the center (leftmost) lane overlap
         # With spreadType="center", lanes spread equally on both sides of the shape
         #
+        # With spreadType="center", lanes spread equally on both sides of the shape.
         # For N lanes with width W, the leftmost lane (index N-1) center is at:
         #   position = (N - 1) / 2 * W  (to the left of shape centerline)
         #
-        # After adding 1 lane (N+1 total), the new leftmost lane center is at:
-        #   position = N / 2 * W
+        # For two opposite-direction edges with shapes at the same position:
+        # - Edge 1's leftmost lane is at +(N-1)/2 * W (to its left)
+        # - Edge 2's leftmost lane is at -(N-1)/2 * W (opposite absolute direction)
+        # - Distance between them = (N-1) * W
         #
-        # To make the leftmost lanes of both edges overlap at the road center,
-        # we offset each edge to the RIGHT by: ((N - 1) / 2) * W
-        # Each edge shifts, bringing them one lane closer together.
+        # To make leftmost lanes overlap at road center, each edge must shift RIGHT
+        # by (N-1)/2 * W. This moves their shapes apart, but since the leftmost lanes
+        # are on opposite sides, they meet in the middle.
         #
-        # Example: 3 lanes -> 4 lanes, W = 3.2m
+        # Example: 2 lanes, W = 3.2m
+        #   offset = ((2 - 1) / 2) * 3.2 = 1.6m
+        #   Each edge shifts right 1.6m, leftmost lanes now overlap at center
+        #
+        # Example: 3 lanes, W = 3.2m
         #   offset = ((3 - 1) / 2) * 3.2 = 3.2m
-        #   Each edge shifts right 3.2m, their leftmost lanes now overlap at center
-        offset_distance = ((edge.num_lanes - 2) / 2) * lane_width
+        #   Each edge shifts right 3.2m, leftmost lanes now overlap at center
+        offset_distance = ((edge.num_lanes - 1) / 2) * lane_width
 
         logger.info(f"  Offset distance: {offset_distance:.2f}m (to overlap only center lane)")
 
@@ -873,7 +971,10 @@ def add_center_lane_to_edges(
             if not original_reverse_shape and original_shape:
                 original_reverse_shape = reverse_shape(original_shape)
 
-            # Offset edge 1 to the RIGHT (shifts lanes toward right side of road)
+            # Offset edge 1 to the RIGHT (shifts shape away from road center)
+            # Both edges shift RIGHT relative to their direction, which moves the shapes apart.
+            # Since leftmost lanes are on opposite sides of the road, this brings them together
+            # to overlap at the road center.
             offset_shape_1 = offset_shape(original_shape, offset_distance, direction='right')
 
             # Offset edge 2 to the RIGHT (relative to its direction)
@@ -1363,28 +1464,28 @@ Road Configuration:
         '--node-up',
         nargs='+',
         default=None,
-        help='Node IDs to shift UP (increase Y coordinate)'
+        help='Node specs to shift UP. Format: "NODE_ID" (absolute +Y) or "NODE_ID:EDGE_ID" (perpendicular-left relative to edge)'
     )
 
     parser.add_argument(
         '--node-down',
         nargs='+',
         default=None,
-        help='Node IDs to shift DOWN (decrease Y coordinate)'
+        help='Node specs to shift DOWN. Format: "NODE_ID" (absolute -Y) or "NODE_ID:EDGE_ID" (perpendicular-right relative to edge)'
     )
 
     parser.add_argument(
         '--node-left',
         nargs='+',
         default=None,
-        help='Node IDs to shift LEFT (decrease X coordinate)'
+        help='Node specs to shift LEFT. Format: "NODE_ID" (absolute -X) or "NODE_ID:EDGE_ID" (parallel-backwards relative to edge)'
     )
 
     parser.add_argument(
         '--node-right',
         nargs='+',
         default=None,
-        help='Node IDs to shift RIGHT (increase X coordinate)'
+        help='Node specs to shift RIGHT. Format: "NODE_ID" (absolute +X) or "NODE_ID:EDGE_ID" (parallel-forwards relative to edge)'
     )
 
     parser.add_argument(
@@ -1453,6 +1554,54 @@ Road Configuration:
                 logger.error("Node file required for node shifting")
                 sys.exit(1)
 
+            # Check if any node specs have edge references (NODE_ID:EDGE_ID format)
+            all_node_specs = (args.node_up or []) + (args.node_down or []) + \
+                            (args.node_left or []) + (args.node_right or [])
+            has_edge_refs = any(':' in spec for spec in all_node_specs)
+
+            # Load edge map if edge references are used
+            edge_map_for_nodes: Optional[Dict[str, EdgeInfo]] = None
+            if has_edge_refs:
+                logger.info(f"Reading edge file for edge-relative node shifting: {args.input_edge_file}")
+                tree = ET.parse(args.input_edge_file)
+                root = tree.getroot()
+
+                edge_map_for_nodes = {}
+                for edge_elem in root.findall('edge'):
+                    edge_id = edge_elem.get('id')
+                    from_node = edge_elem.get('from')
+                    to_node = edge_elem.get('to')
+
+                    if edge_id is None or from_node is None or to_node is None:
+                        continue
+
+                    edge_map_for_nodes[edge_id] = EdgeInfo(
+                        id=edge_id,
+                        from_node=from_node,
+                        to_node=to_node,
+                        shape=edge_elem.get('shape', ''),
+                        num_lanes=int(edge_elem.get('numLanes', '1')),
+                        element=edge_elem,
+                        name=edge_elem.get('name'),
+                        speed=edge_elem.get('speed'),
+                        priority=edge_elem.get('priority'),
+                        edge_type=edge_elem.get('type')
+                    )
+
+                logger.info(f"Found {len(edge_map_for_nodes)} edges")
+
+                # Load node coordinates to derive shapes for edges without them
+                node_coords = load_node_coordinates(node_file)
+                if node_coords:
+                    logger.info(f"Loaded {len(node_coords)} node coordinates")
+                    edges_without_shape = [e for e in edge_map_for_nodes.values() if not e.shape]
+                    if edges_without_shape:
+                        logger.info(f"Deriving shapes for {len(edges_without_shape)} edges without explicit shape")
+                        for edge in edges_without_shape:
+                            derived_shape = derive_shape_from_nodes(edge.from_node, edge.to_node, node_coords)
+                            if derived_shape:
+                                edge.shape = derived_shape
+
             node_shift_dist = args.node_shift_distance if args.node_shift_distance else (args.lane_width / 2)
             shift_specific_nodes(
                 node_file,
@@ -1462,7 +1611,8 @@ Road Configuration:
                 args.node_left or [],
                 args.node_right or [],
                 node_shift_dist,
-                args.dry_run
+                edge_map=edge_map_for_nodes,
+                dry_run=args.dry_run
             )
             sys.exit(0)
 
