@@ -141,6 +141,64 @@ def offset_shape(shape_str: str, offset_distance: float, direction: str = 'right
     return coords_to_shape(offset_coords)
 
 
+def load_node_coordinates(node_file: str) -> Dict[str, Tuple[float, float]]:
+    """
+    Load node coordinates from a SUMO node XML file.
+
+    Args:
+        node_file: Path to the node XML file
+
+    Returns:
+        Dictionary mapping node ID to (x, y) coordinates
+    """
+    node_coords: Dict[str, Tuple[float, float]] = {}
+
+    if not node_file or not os.path.exists(node_file):
+        return node_coords
+
+    tree = ET.parse(node_file)
+    root = tree.getroot()
+
+    for node_elem in root.findall('node'):
+        node_id = node_elem.get('id')
+        x = node_elem.get('x')
+        y = node_elem.get('y')
+
+        if node_id and x and y:
+            node_coords[node_id] = (float(x), float(y))
+
+    return node_coords
+
+
+def derive_shape_from_nodes(
+    from_node: str,
+    to_node: str,
+    node_coords: Dict[str, Tuple[float, float]]
+) -> str:
+    """
+    Derive a shape string from node coordinates.
+
+    When an edge doesn't have an explicit shape, SUMO uses a straight line
+    between the from_node and to_node. This function creates that shape string.
+
+    Args:
+        from_node: ID of the starting node
+        to_node: ID of the ending node
+        node_coords: Dictionary mapping node ID to (x, y) coordinates
+
+    Returns:
+        Shape string in the format "x1,y1 x2,y2" or empty string if nodes not found
+    """
+    if from_node not in node_coords or to_node not in node_coords:
+        logger.warning(f"Cannot derive shape: node(s) not found (from={from_node}, to={to_node})")
+        return ""
+
+    from_x, from_y = node_coords[from_node]
+    to_x, to_y = node_coords[to_node]
+
+    return f"{from_x:.2f},{from_y:.2f} {to_x:.2f},{to_y:.2f}"
+
+
 def find_reverse_edge(edge_id: str, edge_map: Dict[str, EdgeInfo]) -> Optional[EdgeInfo]:
     """Find the reverse edge for a given edge ID."""
     if edge_id not in edge_map:
@@ -192,6 +250,12 @@ def shift_specified_edges(
         edge = edge_map[edge_id]
         reverse_edge = find_reverse_edge(edge_id, edge_map)
 
+        # Check if edge has a shape (derived or explicit)
+        if not edge.shape:
+            logger.warning(f"Edge {edge_id} has no shape - cannot shift. "
+                          f"Try providing node file with --node-file to derive shape from node coordinates.")
+            return 0
+
         dir_name = "UP" if shift_up else "DOWN"
         logger.info(f"    Shifting {dir_name}: {edge.id}" + (f" & {reverse_edge.id}" if reverse_edge else ""))
 
@@ -202,20 +266,28 @@ def shift_specified_edges(
             #   - 'left' (counter-clockwise 90°) = positive Y direction (UP)
             #   - 'right' (clockwise 90°) = negative Y direction (DOWN)
             primary_direction = 'left' if shift_up else 'right'
-            edge.element.set('shape', offset_shape(edge.shape, shift_distance, direction=primary_direction))
-            count += 1
-
-            if reverse_edge:
-                # For the reverse edge (going opposite direction): use OPPOSITE relative direction
-                # Because for a west-going edge (opposite to east-going):
-                #   - 'left' = negative Y (DOWN) - opposite of east-going
-                #   - 'right' = positive Y (UP) - opposite of east-going
-                # So to move both edges in the same absolute direction, reverse edge uses opposite relative direction
-                reverse_direction = 'right' if shift_up else 'left'
-                reverse_edge.element.set('shape', offset_shape(reverse_edge.shape, shift_distance, direction=reverse_direction))
+            new_shape = offset_shape(edge.shape, shift_distance, direction=primary_direction)
+            if new_shape:
+                edge.element.set('shape', new_shape)
                 count += 1
 
-        return count if not dry_run else (2 if reverse_edge else 1)
+            if reverse_edge:
+                # Check if reverse edge has a shape
+                if not reverse_edge.shape:
+                    logger.warning(f"Reverse edge {reverse_edge.id} has no shape - cannot shift.")
+                else:
+                    # For the reverse edge (going opposite direction): use OPPOSITE relative direction
+                    # Because for a west-going edge (opposite to east-going):
+                    #   - 'left' = negative Y (DOWN) - opposite of east-going
+                    #   - 'right' = positive Y (UP) - opposite of east-going
+                    # So to move both edges in the same absolute direction, reverse edge uses opposite relative direction
+                    reverse_direction = 'right' if shift_up else 'left'
+                    new_reverse_shape = offset_shape(reverse_edge.shape, shift_distance, direction=reverse_direction)
+                    if new_reverse_shape:
+                        reverse_edge.element.set('shape', new_reverse_shape)
+                        count += 1
+
+        return count if not dry_run else (2 if reverse_edge and reverse_edge.shape else 1)
 
     if edges_up or edges_down:
         logger.info(f"\nShifting specified edges:")
@@ -715,6 +787,29 @@ def add_center_lane_to_edges(
 
     logger.info(f"Found {len(edge_map)} total edges")
 
+    # Load node coordinates to derive shapes for edges that don't have them
+    node_coords: Dict[str, Tuple[float, float]] = {}
+    if node_file:
+        node_coords = load_node_coordinates(node_file)
+        logger.info(f"Loaded {len(node_coords)} node coordinates from {node_file}")
+    else:
+        # Try to infer node file from edge file
+        inferred_node_file = input_edge_file.replace('.edg.xml', '.nod.xml')
+        if os.path.exists(inferred_node_file):
+            node_coords = load_node_coordinates(inferred_node_file)
+            logger.info(f"Loaded {len(node_coords)} node coordinates from {inferred_node_file}")
+
+    # Derive shapes for edges that don't have explicit shapes
+    edges_without_shape = [e for e in edge_map.values() if not e.shape]
+    if edges_without_shape and node_coords:
+        logger.info(f"Deriving shapes for {len(edges_without_shape)} edges without explicit shape")
+        for edge in edges_without_shape:
+            derived_shape = derive_shape_from_nodes(edge.from_node, edge.to_node, node_coords)
+            if derived_shape:
+                edge.shape = derived_shape
+                # Also update the EdgeInfo's shape attribute
+                logger.debug(f"  Derived shape for {edge.id}: {derived_shape}")
+
     # Process specified edges
     processed: Set[str] = set()
     modified_count = 0
@@ -737,6 +832,12 @@ def add_center_lane_to_edges(
         logger.info(f"\nProcessing edge pair: {edge.id} <-> {reverse_edge.id}")
         logger.info(f"  Name: {edge.name}")
         logger.info(f"  Current lanes: {edge.num_lanes} / {reverse_edge.num_lanes}")
+
+        # Check if edge has a shape (explicit or derived)
+        if not edge.shape:
+            logger.warning(f"  Edge {edge_id} has no shape - skipping. "
+                          f"Ensure node file is available to derive shape from node coordinates.")
+            continue
 
         # Calculate new lane count (add 1 for center lane)
         new_lane_count = edge.num_lanes + 1
@@ -780,9 +881,9 @@ def add_center_lane_to_edges(
             # This preserves the correct endpoint positions for each edge
             offset_shape_2 = offset_shape(original_reverse_shape, offset_distance, direction='right')
 
-            logger.info(f"  Original shape (edge 1): {original_shape[:50]}...")
-            logger.info(f"  Offset shape (edge 1):   {offset_shape_1[:50]}...")
-            logger.info(f"  Offset shape (edge 2):   {offset_shape_2[:50]}...")
+            logger.info(f"  Original shape (edge 1): {original_shape[:50] if original_shape else '(none)'}...")
+            logger.info(f"  Offset shape (edge 1):   {offset_shape_1[:50] if offset_shape_1 else '(none)'}...")
+            logger.info(f"  Offset shape (edge 2):   {offset_shape_2[:50] if offset_shape_2 else '(none)'}...")
 
             # Update edge 1
             edge.element.set('numLanes', str(new_lane_count))
@@ -1396,6 +1497,27 @@ Road Configuration:
                 )
 
             logger.info(f"Found {len(edge_map)} total edges")
+
+            # Load node coordinates to derive shapes for edges that don't have them
+            node_coords: Dict[str, Tuple[float, float]] = {}
+            if node_file:
+                node_coords = load_node_coordinates(node_file)
+                logger.info(f"Loaded {len(node_coords)} node coordinates from {node_file}")
+            else:
+                # Try to infer node file from edge file
+                inferred_node_file = args.input_edge_file.replace('.edg.xml', '.nod.xml')
+                if os.path.exists(inferred_node_file):
+                    node_coords = load_node_coordinates(inferred_node_file)
+                    logger.info(f"Loaded {len(node_coords)} node coordinates from {inferred_node_file}")
+
+            # Derive shapes for edges that don't have explicit shapes
+            edges_without_shape = [e for e in edge_map.values() if not e.shape]
+            if edges_without_shape and node_coords:
+                logger.info(f"Deriving shapes for {len(edges_without_shape)} edges without explicit shape")
+                for edge in edges_without_shape:
+                    derived_shape = derive_shape_from_nodes(edge.from_node, edge.to_node, node_coords)
+                    if derived_shape:
+                        edge.shape = derived_shape
 
             shift_distance = args.lane_width / 2
             shift_specified_edges(
