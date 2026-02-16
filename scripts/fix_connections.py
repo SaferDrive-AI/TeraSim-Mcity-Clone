@@ -3,12 +3,27 @@
 SUMO Connection Lane Assignment Fixer
 
 This script identifies and fixes incorrect lane assignments in SUMO connection files.
-A common issue is when multi-lane roads have all turn directions assigned to one lane
-(e.g., right, straight, and left on lane 0) while another lane only has U-turns.
+It can automatically detect all multi-lane edges with incorrect lane assignments
+and fix them based on standard traffic rules.
 
-The correct pattern for a 2-lane road should be:
+Lane Assignment Rules for 4-way intersections:
+- Rightmost lane (0): right turns only
+- Middle lanes (1 to N-2): straight only
+- Leftmost lane (N-1): left turns + U-turns only
+
+For 2-lane roads:
 - Lane 0 (right lane): right turn + straight
 - Lane 1 (left lane): left turn + U-turn
+
+Usage:
+  # Auto-detect and fix all incorrect assignments
+  python fix_connections.py network.edg.xml --auto-detect
+
+  # Dry run to see what would be changed
+  python fix_connections.py network.edg.xml --auto-detect --dry-run
+
+  # If network has sidewalks on lane 0
+  python fix_connections.py network.edg.xml --auto-detect --has-sidewalk
 
 Author: TeraSim Team
 License: MIT
@@ -20,9 +35,16 @@ from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict
 import argparse
 import logging
+import math
 import os
 import sys
-import math
+
+from sumo_net_utils import (
+    parse_osm_centre_turn_lanes,
+    find_edges_by_osm_ids,
+    parse_shape_coordinates,
+    determine_turn_direction,
+)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -61,21 +83,9 @@ class ConnectionInfo:
     direction: Optional[str] = None  # 'r' (right), 's' (straight), 'l' (left), 't' (turn/u-turn)
 
 
-def parse_shape_coordinates(shape_str: str) -> List[Tuple[float, float]]:
-    """Parse shape string into list of coordinate tuples."""
-    if not shape_str:
-        return []
-
-    coords = []
-    for coord_pair in shape_str.strip().split():
-        x, y = coord_pair.split(',')
-        coords.append((float(x), float(y)))
-    return coords
-
-
 def calculate_angle(shape_str: str) -> float:
     """
-    Calculate the heading angle of an edge based on its shape.
+    Calculate the heading angle of an edge at its end based on its shape.
 
     Returns angle in degrees (0-360, where 0 is East, 90 is North)
     """
@@ -86,36 +96,11 @@ def calculate_angle(shape_str: str) -> float:
     if len(coords) < 2:
         return 0.0
 
-    # Use last two points to determine heading at the end
     x1, y1 = coords[-2]
     x2, y2 = coords[-1]
 
     angle = math.atan2(y2 - y1, x2 - x1)
     return math.degrees(angle) % 360
-
-
-def determine_turn_direction(from_angle: float, to_angle: float) -> str:
-    """
-    Determine the turn direction based on incoming and outgoing angles.
-
-    Returns: 'r' (right), 's' (straight), 'l' (left), or 't' (u-turn)
-    """
-    # Calculate the turn angle
-    turn = (to_angle - from_angle) % 360
-
-    # Normalize to -180 to 180
-    if turn > 180:
-        turn -= 360
-
-    # Classify the turn
-    if -45 <= turn <= 45:
-        return 's'  # straight
-    elif 45 < turn <= 135:
-        return 'l'  # left
-    elif -135 <= turn < -45:
-        return 'r'  # right
-    else:
-        return 't'  # u-turn (turn around)
 
 
 def find_bidirectional_pairs(edges: List[EdgeInfo]) -> Dict[str, str]:
@@ -192,101 +177,210 @@ def analyze_edge_connections(
             conn.direction = determine_turn_direction(from_angle, to_angle)
 
 
+def _get_vehicle_lanes(
+    edge_id: str,
+    edge: EdgeInfo,
+    has_sidewalk: bool,
+    center_turn_lane_edges: Optional[Set[str]] = None
+) -> Tuple[int, int, int, List[int], Set[int]]:
+    """
+    Calculate the effective vehicle lane indices for an edge, excluding
+    sidewalk and center turn lanes.
+
+    Returns:
+        Tuple of (num_vehicle_lanes, right_lane, left_lane, middle_lanes, excluded_lanes)
+    """
+    excluded_lanes: Set[int] = set()
+
+    # Exclude sidewalk (lane 0)
+    if has_sidewalk:
+        excluded_lanes.add(0)
+
+    # Exclude center turn lane (lane 1 after center lane insertion)
+    # The center lane is inserted at index 1 by add_bidirectional_center_lane.py
+    if center_turn_lane_edges and edge_id in center_turn_lane_edges:
+        center_idx = 1 if not has_sidewalk else 2
+        if center_idx < edge.num_lanes:
+            excluded_lanes.add(center_idx)
+
+    # Build list of vehicle lanes (all lanes minus excluded)
+    vehicle_lanes = [i for i in range(edge.num_lanes) if i not in excluded_lanes]
+    num_vehicle_lanes = len(vehicle_lanes)
+
+    if num_vehicle_lanes < 2:
+        return num_vehicle_lanes, -1, -1, [], excluded_lanes
+
+    right_lane = vehicle_lanes[0]
+    left_lane = vehicle_lanes[-1]
+    middle_lanes = vehicle_lanes[1:-1]
+
+    return num_vehicle_lanes, right_lane, left_lane, middle_lanes, excluded_lanes
+
+
 def has_incorrect_lane_assignment(
     edge_id: str,
     connections: List[ConnectionInfo],
-    edge_map: Dict[str, EdgeInfo]
-) -> bool:
+    edge_map: Dict[str, EdgeInfo],
+    has_sidewalk: bool = False,
+    center_turn_lane_edges: Optional[Set[str]] = None
+) -> Tuple[bool, List[str]]:
     """
     Check if an edge has incorrect lane assignments.
 
-    The typical incorrect pattern is:
-    - Lane 0 (right): right, straight, AND left turns
-    - Lane 1 (left): only U-turn
+    Correct lane assignment rules for multi-lane roads:
+    - Rightmost vehicle lane: right turns only
+    - Middle lanes: straight only
+    - Leftmost lane: left turns + U-turns only
+
+    Excluded lanes (sidewalk, center turn lane) are skipped.
+
+    Args:
+        edge_id: Edge ID to check
+        connections: List of all connections
+        edge_map: Dictionary of edge ID to EdgeInfo
+        has_sidewalk: If True, lane 0 is sidewalk
+        center_turn_lane_edges: Set of edge IDs that have a center turn lane
+
+    Returns:
+        Tuple of (has_incorrect, list_of_issues)
     """
     edge_connections = [c for c in connections if c.from_edge == edge_id]
 
     if edge_id not in edge_map:
-        return False
+        return False, []
 
     edge = edge_map[edge_id]
-    if edge.num_lanes < 2:
-        return False
+    num_vehicle_lanes, right_lane, left_lane, middle_lanes, excluded_lanes = \
+        _get_vehicle_lanes(edge_id, edge, has_sidewalk, center_turn_lane_edges)
 
-    # Get connections by lane
+    if num_vehicle_lanes < 2:
+        return False, []
+
+    # Get connections by lane (only for vehicle lanes)
     lane_connections: Dict[int, List[ConnectionInfo]] = defaultdict(list)
     for conn in edge_connections:
+        if conn.from_lane in excluded_lanes:
+            continue
         lane_connections[conn.from_lane].append(conn)
 
-    right_lane = 0
-    left_lane = edge.num_lanes - 1
+    issues = []
 
+    # Check rightmost vehicle lane
     right_lane_conns = lane_connections.get(right_lane, [])
+    for conn in right_lane_conns:
+        if conn.direction == 'l':
+            issues.append(f"Lane {right_lane} has left turn (should be on leftmost lane {left_lane})")
+        elif conn.direction == 't':
+            issues.append(f"Lane {right_lane} has U-turn (should be on leftmost lane {left_lane})")
+
+    # Check middle lanes (should only have straight)
+    for mid_lane in middle_lanes:
+        mid_conns = lane_connections.get(mid_lane, [])
+        for conn in mid_conns:
+            if conn.direction == 'l':
+                issues.append(f"Lane {mid_lane} has left turn (should be on leftmost lane {left_lane})")
+            elif conn.direction == 't':
+                issues.append(f"Lane {mid_lane} has U-turn (should be on leftmost lane {left_lane})")
+            elif conn.direction == 'r':
+                issues.append(f"Lane {mid_lane} has right turn (should be on rightmost lane {right_lane})")
+
+    # Check leftmost lane (should only have left turns and U-turns)
     left_lane_conns = lane_connections.get(left_lane, [])
+    for conn in left_lane_conns:
+        if conn.direction == 'r':
+            issues.append(f"Lane {left_lane} has right turn (should be on rightmost lane {right_lane})")
 
-    # Check for the problematic pattern:
-    # Right lane has left turns AND left lane only has U-turns
-    right_lane_has_left = any(c.direction == 'l' for c in right_lane_conns if c.direction)
-    left_lane_only_uturn = (
-        len(left_lane_conns) > 0 and
-        all(c.direction == 't' for c in left_lane_conns if c.direction)
-    )
-
-    if right_lane_has_left and left_lane_only_uturn:
-        return True
-
-    return False
+    return len(issues) > 0, issues
 
 
 def fix_connections_for_edge(
     edge_id: str,
     connections: List[ConnectionInfo],
     edge_map: Dict[str, EdgeInfo],
-    dry_run: bool = False
+    dry_run: bool = False,
+    has_sidewalk: bool = False,
+    center_turn_lane_edges: Optional[Set[str]] = None
 ) -> int:
     """
     Fix connection lane assignments for an edge.
 
-    Correct pattern:
-    - Lane 0 (right): right turn + straight
-    - Lane 1 (left): left turn + U-turn
+    Correct pattern for multi-lane roads:
+    - Rightmost vehicle lane: right turns
+    - Middle vehicle lanes: straight
+    - Leftmost vehicle lane: left turns + U-turns
+
+    Excluded lanes (sidewalk, center turn lane) are not assigned regular traffic.
+
+    For 2-vehicle-lane roads:
+    - Rightmost vehicle lane: right + straight
+    - Leftmost vehicle lane: left + U-turn
+
+    Args:
+        edge_id: Edge ID to fix
+        connections: List of all connections
+        edge_map: Dictionary of edge ID to EdgeInfo
+        dry_run: If True, only report changes without modifying
+        has_sidewalk: If True, lane 0 is sidewalk
+        center_turn_lane_edges: Set of edge IDs that have a center turn lane
     """
     if edge_id not in edge_map:
         return 0
 
     edge = edge_map[edge_id]
-    if edge.num_lanes < 2:
+    num_vehicle_lanes, right_lane, left_lane, middle_lanes, excluded_lanes = \
+        _get_vehicle_lanes(edge_id, edge, has_sidewalk, center_turn_lane_edges)
+
+    if num_vehicle_lanes < 2:
         return 0
 
     edge_connections = [c for c in connections if c.from_edge == edge_id]
 
     fixed_count = 0
-    right_lane = 0
-    left_lane = edge.num_lanes - 1
+
+    # For roads with more than 2 vehicle lanes, use middle lanes for straight
+    # For 2-vehicle-lane roads, straight goes on the right vehicle lane
+    if num_vehicle_lanes > 2 and middle_lanes:
+        # Middle lane for straight (use the lane closest to center)
+        straight_lane = middle_lanes[len(middle_lanes) // 2]
+    else:
+        straight_lane = right_lane
 
     # Fix each connection based on its turn direction
     for conn in edge_connections:
         if conn.direction is None:
             continue
 
+        # Skip excluded lane connections (sidewalk, center turn lane)
+        if conn.from_lane in excluded_lanes:
+            continue
+
         new_lane = conn.from_lane
 
         if conn.direction == 'r':
-            # Right turn should be on right lane
+            # Right turn should be on rightmost vehicle lane
             new_lane = right_lane
         elif conn.direction == 's':
-            # Straight should be on right lane for 2-lane roads
-            new_lane = right_lane
+            # Straight should be on middle lane(s) or right vehicle lane for 2-lane roads
+            if conn.from_lane == left_lane and num_vehicle_lanes > 2:
+                new_lane = straight_lane
+            elif conn.from_lane == left_lane and num_vehicle_lanes == 2:
+                # For 2-lane, straight can stay on right or left vehicle lane, prefer not moving
+                pass
+            elif num_vehicle_lanes > 2 and conn.from_lane == right_lane:
+                # Move straight from rightmost to middle if there are middle lanes
+                new_lane = straight_lane
         elif conn.direction == 'l':
-            # Left turn should be on left lane
+            # Left turn should be on leftmost vehicle lane
             new_lane = left_lane
         elif conn.direction == 't':
-            # U-turn should be on left lane
+            # U-turn should be on leftmost vehicle lane
             new_lane = left_lane
 
         if new_lane != conn.from_lane:
+            dir_map = {'r': 'right', 's': 'straight', 'l': 'left', 't': 'u-turn'}
+            dir_name = dir_map.get(conn.direction, '?')
             logger.info(f"    Fixing: {edge_id}:{conn.from_lane} -> {conn.to_edge}:{conn.to_lane}")
-            logger.info(f"      Direction: {conn.direction}, changing fromLane {conn.from_lane} -> {new_lane}")
+            logger.info(f"      Direction: {dir_name}, changing fromLane {conn.from_lane} -> {new_lane}")
 
             if not dry_run:
                 conn.element.set('fromLane', str(new_lane))
@@ -302,10 +396,23 @@ def fix_connections(
     input_con_file: str,
     output_con_file: str,
     specific_edges: Optional[List[str]] = None,
-    dry_run: bool = False
+    dry_run: bool = False,
+    auto_detect: bool = False,
+    has_sidewalk: bool = False,
+    center_turn_lane_edges: Optional[Set[str]] = None
 ) -> int:
     """
     Fix connection lane assignments for edges with incorrect patterns.
+
+    Args:
+        input_edge_file: Path to edge XML file
+        input_con_file: Path to connection XML file
+        output_con_file: Path to output connection XML file
+        specific_edges: List of specific edge IDs to fix (optional)
+        dry_run: If True, only report changes without modifying files
+        auto_detect: If True, automatically scan all multi-lane edges
+        has_sidewalk: If True, lane 0 is sidewalk and vehicle lanes start from 1
+        center_turn_lane_edges: Set of edge IDs that have a center turn lane
     """
     logger.info(f"Reading edge file: {input_edge_file}")
     logger.info(f"Reading connection file: {input_con_file}")
@@ -376,11 +483,24 @@ def fix_connections(
     # Determine which edges to check
     if specific_edges:
         edges_to_check = specific_edges
+    elif auto_detect:
+        # Auto-detect: check all multi-lane edges
+        edges_to_check = [e.id for e in edges if e.num_lanes >= 2]
+        logger.info(f"Auto-detecting: checking {len(edges_to_check)} multi-lane edges")
     else:
         edges_to_check = [e.id for e in edges if e.num_lanes >= 2]
 
-    # Analyze and fix connections
+    # First pass: analyze all connections to determine turn directions
+    logger.info("Analyzing turn directions for all connections...")
+    for edge_id in edges_to_check:
+        if edge_id not in edge_map:
+            continue
+        reverse_edge_id = reverse_edge_map.get(edge_id)
+        analyze_edge_connections(edge_id, connections, edge_map, reverse_edge_id)
+
+    # Second pass: detect and fix incorrect assignments
     total_fixed = 0
+    edges_with_issues = 0
 
     for edge_id in edges_to_check:
         if edge_id not in edge_map:
@@ -390,14 +510,16 @@ def fix_connections(
         if edge.num_lanes < 2:
             continue
 
-        reverse_edge_id = reverse_edge_map.get(edge_id)
-
-        # Analyze connections to determine turn directions
-        analyze_edge_connections(edge_id, connections, edge_map, reverse_edge_id)
-
         # Check if this edge has incorrect lane assignments
-        if has_incorrect_lane_assignment(edge_id, connections, edge_map):
-            logger.info(f"\nEdge {edge_id} ({edge.name}) has incorrect lane assignments")
+        has_issues, issues = has_incorrect_lane_assignment(edge_id, connections, edge_map, has_sidewalk, center_turn_lane_edges)
+
+        if has_issues:
+            edges_with_issues += 1
+            sidewalk_note = " (with sidewalk on lane 0)" if has_sidewalk else ""
+            logger.info(f"\nEdge {edge_id} ({edge.name or 'unnamed'}) - {edge.num_lanes} lanes{sidewalk_note}")
+            logger.info(f"  Issues detected:")
+            for issue in issues:
+                logger.info(f"    - {issue}")
 
             # Log current state
             edge_conns = [c for c in connections if c.from_edge == edge_id]
@@ -405,10 +527,11 @@ def fix_connections(
             for conn in edge_conns:
                 dir_map = {'r': 'right', 's': 'straight', 'l': 'left', 't': 'u-turn'}
                 dir_name = dir_map.get(conn.direction, '?') if conn.direction else '?'
-                logger.info(f"    Lane {conn.from_lane} -> {conn.to_edge}:{conn.to_lane} ({dir_name})")
+                lane_note = " (sidewalk)" if has_sidewalk and conn.from_lane == 0 else ""
+                logger.info(f"    Lane {conn.from_lane}{lane_note} -> {conn.to_edge}:{conn.to_lane} ({dir_name})")
 
             # Fix the connections
-            fixed = fix_connections_for_edge(edge_id, connections, edge_map, dry_run)
+            fixed = fix_connections_for_edge(edge_id, connections, edge_map, dry_run, has_sidewalk, center_turn_lane_edges)
             total_fixed += fixed
 
     if not dry_run and total_fixed > 0:
@@ -416,7 +539,9 @@ def fix_connections(
         ET.indent(con_tree, space="    ")
         con_tree.write(output_con_file, encoding='UTF-8', xml_declaration=True)
 
-    logger.info(f"\n{'[DRY RUN] ' if dry_run else ''}Fixed {total_fixed} connections")
+    logger.info(f"\n{'[DRY RUN] ' if dry_run else ''}Summary:")
+    logger.info(f"  Edges with issues: {edges_with_issues}")
+    logger.info(f"  Connections fixed: {total_fixed}")
 
     return total_fixed
 
@@ -451,11 +576,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Auto-detect edges from OSM file (recommended)
+  python fix_connections.py Ann_Arbor/aa_plain.edg.xml --osm-file Ann_Arbor/aa_plain.osm --dry-run
+
+  # Auto-detect from OSM with sidewalk support
+  python fix_connections.py Ann_Arbor/aa_plain.edg.xml --osm-file Ann_Arbor/aa_plain.osm --has-sidewalk
+
+  # Auto-detect and fix all incorrect lane assignments in multi-lane edges
+  python fix_connections.py san_jose/osm.edg.xml --auto-detect --dry-run
+
+  # If the network has sidewalks on lane 0, use --has-sidewalk
+  python fix_connections.py san_jose/osm.edg.xml --auto-detect --has-sidewalk --dry-run
+
   # Fix specific edges by ID
   python fix_connections.py Ann_Arbor/aa_plain.edg.xml --edges "87220590#0" "2227868411#0"
-
-  # Dry run to see what would be changed
-  python fix_connections.py Ann_Arbor/aa_plain.edg.xml --edges "87220590#0" --dry-run
 
   # Fix edges by name pattern
   python fix_connections.py Ann_Arbor/aa_plain.edg.xml --names "hubbard" "maple"
@@ -463,8 +597,21 @@ Examples:
   # Specify connection file explicitly
   python fix_connections.py Ann_Arbor/aa_plain.edg.xml --con-file Ann_Arbor/aa_plain.con.xml
 
-  # Specify output file
-  python fix_connections.py Ann_Arbor/aa_plain.edg.xml -o Ann_Arbor/aa_plain_fixed.con.xml
+Lane Assignment Rules:
+  For a 4-way intersection with multi-lane roads (without sidewalk):
+  - Lane 0 (rightmost): right turns only
+  - Middle lanes: straight only
+  - Lane N-1 (leftmost): left turns + U-turns only
+
+  For roads with sidewalk (--has-sidewalk):
+  - Lane 0: sidewalk (ignored)
+  - Lane 1 (rightmost vehicle): right turns only
+  - Middle lanes: straight only
+  - Lane N-1 (leftmost): left turns + U-turns only
+
+  For 2-lane vehicle roads:
+  - Rightmost vehicle lane: right + straight
+  - Leftmost lane: left + U-turn
         """
     )
 
@@ -483,6 +630,23 @@ Examples:
         '-o', '--output',
         help='Output connection XML file (default: overwrites input)',
         default=None
+    )
+
+    parser.add_argument(
+        '--auto-detect',
+        action='store_true',
+        help='Automatically detect and fix all incorrect lane assignments in multi-lane edges'
+    )
+
+    parser.add_argument(
+        '--has-sidewalk',
+        action='store_true',
+        help='If set, lane 0 is treated as sidewalk and vehicle lanes start from lane 1'
+    )
+
+    parser.add_argument(
+        '--osm-file',
+        help='OSM XML file to auto-detect edges with centre_turn_lane=yes tag'
     )
 
     parser.add_argument(
@@ -537,6 +701,32 @@ Examples:
 
     # Find edges to fix
     specific_edges = args.edges
+
+    # Auto-detect from OSM file if provided
+    # Also build the set of center turn lane edges for lane exclusion
+    center_turn_lane_edges: Optional[Set[str]] = None
+    if args.osm_file:
+        if not os.path.exists(args.osm_file):
+            logger.error(f"OSM file not found: {args.osm_file}")
+            sys.exit(1)
+
+        osm_way_ids = parse_osm_centre_turn_lanes(args.osm_file)
+        if osm_way_ids:
+            osm_edges = find_edges_by_osm_ids(args.input_edge_file, osm_way_ids)
+            if osm_edges:
+                # Track ALL matched edges as center turn lane edges
+                center_turn_lane_edges = set(osm_edges)
+                logger.info(f"Identified {len(center_turn_lane_edges)} center turn lane edges")
+
+                if specific_edges:
+                    specific_edges.extend(osm_edges)
+                else:
+                    specific_edges = osm_edges
+            else:
+                logger.warning("No matching edges found in edge file for OSM way IDs")
+        else:
+            logger.warning("No ways with centre_turn_lane=yes found in OSM file")
+
     if args.names:
         logger.info(f"Searching for edges matching names: {args.names}")
         found_edges = find_edges_by_name_pattern(args.input_edge_file, args.names)
@@ -548,8 +738,9 @@ Examples:
         if not specific_edges:
             logger.warning("No edges found matching the specified names")
 
-    if not specific_edges:
-        logger.error("No edges specified. Use --edges or --names to specify edges to fix.")
+    # Check if we have edges to process or auto-detect is enabled
+    if not specific_edges and not args.auto_detect:
+        logger.error("No edges specified. Use --auto-detect, --osm-file, --edges, or --names to specify edges.")
         sys.exit(1)
 
     try:
@@ -558,7 +749,10 @@ Examples:
             input_con_file=con_file,
             output_con_file=output_file,
             specific_edges=specific_edges,
-            dry_run=args.dry_run
+            dry_run=args.dry_run,
+            auto_detect=args.auto_detect,
+            has_sidewalk=args.has_sidewalk,
+            center_turn_lane_edges=center_turn_lane_edges
         )
 
         if fixed_count > 0 and not args.dry_run:
@@ -566,8 +760,8 @@ Examples:
             logger.info("\nNext steps:")
             logger.info("1. Review the changes in the output file")
             logger.info("2. Rebuild the SUMO network using netconvert:")
-            logger.info(f"   netconvert --node-files=aa_plain.nod.xml --edge-files=aa_plain.edg.xml \\")
-            logger.info(f"              --connection-files={os.path.basename(output_file)} --output-file=aa_fixed.net.xml")
+            logger.info(f"   netconvert --node-files=<node_file>.nod.xml --edge-files=<edge_file>.edg.xml \\")
+            logger.info(f"              --connection-files={os.path.basename(output_file)} --output-file=<output>.net.xml")
 
         sys.exit(0)
 

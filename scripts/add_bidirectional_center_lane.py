@@ -2,19 +2,15 @@
 """
 SUMO Bidirectional Center Lane Creator
 
-This script adds a bidirectional center lane to roads that should have:
-- 2 lanes in each direction (on the sides) - EXISTING, kept as-is
-- 1 shared bidirectional lane in the middle - NEW, added by this script
+Adds a shared bidirectional center turn lane to road edge pairs identified
+from OSM tags (centre_turn_lane=yes) or specified manually.
 
-For roads like West Huron Street where the original data shows a center lane
-that can be used in either direction, but SUMO conversion only created
-the single-directional lanes on each side.
-
-The script:
-1. Takes a pair of edges (forward and reverse)
-2. Adds one lane to each edge (inserting it as the new center lane)
-3. The center lanes overlap exactly (spreadType="center") for bidirectional use
-4. Shifts existing lane indices and updates all connections
+For each edge pair (forward + reverse):
+1. Adds one lane to each edge (the new center lane at index 1)
+2. Offsets both edges so the center lanes overlap at the road centerline
+3. Removes stale connections and traffic light definitions at affected junctions
+   (netconvert auto-generates replacements)
+4. Marks processed edges with <param key="centerLaneAdded"> for idempotency
 
 Lane layout change:
   Before: Edge has lanes [0, 1] (2 lanes)
@@ -30,11 +26,17 @@ License: MIT
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Set
-from copy import deepcopy
 import argparse
 import logging
+import math
 import os
 import sys
+
+from sumo_net_utils import (
+    parse_osm_centre_turn_lanes,
+    find_edges_by_osm_ids,
+    parse_shape_coordinates,
+)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -59,17 +61,6 @@ class EdgeInfo:
     def reverse_node_pair(self) -> Tuple[str, str]:
         """Return reverse node pair"""
         return (self.to_node, self.from_node)
-
-
-def parse_shape_coordinates(shape_str: str) -> List[Tuple[float, float]]:
-    """Parse shape string into list of coordinate tuples."""
-    if not shape_str:
-        return []
-    coords = []
-    for coord_pair in shape_str.strip().split():
-        x, y = coord_pair.split(',')
-        coords.append((float(x), float(y)))
-    return coords
 
 
 def reverse_shape(shape_str: str) -> str:
@@ -101,8 +92,6 @@ def offset_shape(shape_str: str, offset_distance: float, direction: str = 'right
     Returns:
         New shape string with offset coordinates
     """
-    import math
-
     coords = parse_shape_coordinates(shape_str)
     if len(coords) < 2:
         return shape_str
@@ -181,8 +170,6 @@ def calculate_edge_direction(shape_str: str) -> Tuple[float, float]:
         Tuple (dx, dy) representing the normalized direction vector.
         Returns (1, 0) if shape is invalid.
     """
-    import math
-
     if not shape_str:
         return (1.0, 0.0)
 
@@ -924,43 +911,54 @@ def add_center_lane_to_edges(
         logger.info(f"  Name: {edge.name}")
         logger.info(f"  Current lanes: {edge.num_lanes} / {reverse_edge.num_lanes}")
 
+        # Skip if edge was already processed by this script in a previous run
+        # Check for a <param key="centerLaneAdded" value="true"/> child element
+        center_lane_param = edge.element.find("param[@key='centerLaneAdded']")
+        if center_lane_param is not None and center_lane_param.get('value') == 'true':
+            logger.warning(f"  Edge {edge_id} already has centerLaneAdded param - skipping "
+                          f"(already processed in a previous run)")
+            processed.add(edge_id)
+            processed.add(reverse_edge.id)
+            continue
+
         # Check if edge has a shape (explicit or derived)
         if not edge.shape:
             logger.warning(f"  Edge {edge_id} has no shape - skipping. "
                           f"Ensure node file is available to derive shape from node coordinates.")
             continue
 
-        # Calculate new lane count (add 1 for center lane)
-        new_lane_count = edge.num_lanes + 1
+        # Skip asymmetric pairs (different lane counts between forward and reverse).
+        # Center lane insertion only makes sense when both directions have the same
+        # number of lanes, giving an even total (N + N). Odd totals (N + M, N != M)
+        # indicate an unusual road geometry that shouldn't be modified.
+        if edge.num_lanes != reverse_edge.num_lanes:
+            logger.warning(f"  Skipping asymmetric pair: {edge.id} has {edge.num_lanes} lanes, "
+                          f"{reverse_edge.id} has {reverse_edge.num_lanes} lanes")
+            processed.add(edge_id)
+            processed.add(reverse_edge.id)
+            continue
 
-        logger.info(f"  New lanes: {new_lane_count} (adding center bidirectional lane)")
+        # Calculate new lane count (same for both edges since they're symmetric)
+        new_lane_count_1 = edge.num_lanes + 1
+        new_lane_count_2 = reverse_edge.num_lanes + 1
 
-        # Calculate offset to make only the center (leftmost) lane overlap
-        # With spreadType="center", lanes spread equally on both sides of the shape
-        #
-        # With spreadType="center", lanes spread equally on both sides of the shape.
-        # For N lanes with width W, the leftmost lane (index N-1) center is at:
-        #   position = (N - 1) / 2 * W  (to the left of shape centerline)
-        #
-        # For two opposite-direction edges with shapes at the same position:
-        # - Edge 1's leftmost lane is at +(N-1)/2 * W (to its left)
-        # - Edge 2's leftmost lane is at -(N-1)/2 * W (opposite absolute direction)
-        # - Distance between them = (N-1) * W
-        #
-        # To make leftmost lanes overlap at road center, each edge must shift RIGHT
-        # by (N-1)/2 * W. This moves their shapes apart, but since the leftmost lanes
-        # are on opposite sides, they meet in the middle.
-        #
-        # Example: 2 lanes, W = 3.2m
-        #   offset = ((2 - 1) / 2) * 3.2 = 1.6m
-        #   Each edge shifts right 1.6m, leftmost lanes now overlap at center
-        #
-        # Example: 3 lanes, W = 3.2m
-        #   offset = ((3 - 1) / 2) * 3.2 = 3.2m
-        #   Each edge shifts right 3.2m, leftmost lanes now overlap at center
-        offset_distance = ((edge.num_lanes - 1) / 2) * lane_width
+        logger.info(f"  New lanes: {new_lane_count_1} / {new_lane_count_2} (adding center bidirectional lane)")
 
-        logger.info(f"  Offset distance: {offset_distance:.2f}m (to overlap only center lane)")
+        # Calculate offset to keep the center lane (lane 1) overlapping.
+        # With spreadType="center", lane 1 of an N-lane edge sits at position
+        # (1 - (N-1)/2) * W from the shape centerline. For N=3, lane 1 is at 0
+        # (the shape center itself), so no shift is needed for 2->3 lane edges.
+        #
+        # For edges that already had >2 lanes, we shift RIGHT by
+        # (N_old - 2) / 2 * W to account for the extra original lanes.
+        #
+        # Examples (W = 3.2m):
+        #   2 lanes -> 3 lanes: offset = (2-2)/2 * 3.2 = 0.00m (no shift)
+        #   3 lanes -> 4 lanes: offset = (3-2)/2 * 3.2 = 1.60m
+        offset_distance_1 = max(0, ((edge.num_lanes - 2) / 2)) * lane_width
+        offset_distance_2 = max(0, ((reverse_edge.num_lanes - 2) / 2)) * lane_width
+
+        logger.info(f"  Offset distance: {offset_distance_1:.2f}m / {offset_distance_2:.2f}m (to overlap only center lane)")
 
         if not dry_run:
             # Get original shapes
@@ -975,37 +973,82 @@ def add_center_lane_to_edges(
             # Both edges shift RIGHT relative to their direction, which moves the shapes apart.
             # Since leftmost lanes are on opposite sides of the road, this brings them together
             # to overlap at the road center.
-            offset_shape_1 = offset_shape(original_shape, offset_distance, direction='right')
+            offset_shape_1 = offset_shape(original_shape, offset_distance_1, direction='right')
 
             # Offset edge 2 to the RIGHT (relative to its direction)
             # IMPORTANT: Use the actual reverse edge's shape, not a reversed copy of forward edge
             # This preserves the correct endpoint positions for each edge
-            offset_shape_2 = offset_shape(original_reverse_shape, offset_distance, direction='right')
+            offset_shape_2 = offset_shape(original_reverse_shape, offset_distance_2, direction='right')
 
             logger.info(f"  Original shape (edge 1): {original_shape[:50] if original_shape else '(none)'}...")
             logger.info(f"  Offset shape (edge 1):   {offset_shape_1[:50] if offset_shape_1 else '(none)'}...")
             logger.info(f"  Offset shape (edge 2):   {offset_shape_2[:50] if offset_shape_2 else '(none)'}...")
 
             # Update edge 1
-            edge.element.set('numLanes', str(new_lane_count))
+            edge.element.set('numLanes', str(new_lane_count_1))
             edge.element.set('shape', offset_shape_1)
             edge.element.set('spreadType', 'center')
+            # Add param marker for idempotency detection
+            param1 = ET.SubElement(edge.element, 'param')
+            param1.set('key', 'centerLaneAdded')
+            param1.set('value', 'true')
 
             # Update edge 2
-            reverse_edge.element.set('numLanes', str(new_lane_count))
+            reverse_edge.element.set('numLanes', str(new_lane_count_2))
             reverse_edge.element.set('shape', offset_shape_2)
             reverse_edge.element.set('spreadType', 'center')
+            param2 = ET.SubElement(reverse_edge.element, 'param')
+            param2.set('key', 'centerLaneAdded')
+            param2.set('value', 'true')
 
             # Update lane elements if they exist
-            _update_lane_elements(edge.element, new_lane_count)
-            _update_lane_elements(reverse_edge.element, new_lane_count)
+            _update_lane_elements(edge.element, new_lane_count_1)
+            _update_lane_elements(reverse_edge.element, new_lane_count_2)
 
-            logger.info(f"  ✓ Updated edge {edge.id} - shifted right by {offset_distance:.2f}m")
-            logger.info(f"  ✓ Updated edge {reverse_edge.id} - shifted right by {offset_distance:.2f}m")
+            logger.info(f"  ✓ Updated edge {edge.id}: {edge.num_lanes} -> {new_lane_count_1} lanes, shifted right by {offset_distance_1:.2f}m")
+            logger.info(f"  ✓ Updated edge {reverse_edge.id}: {reverse_edge.num_lanes} -> {new_lane_count_2} lanes, shifted right by {offset_distance_2:.2f}m")
 
         processed.add(edge_id)
         processed.add(reverse_edge.id)
         modified_count += 1
+
+    # Remove connections involving modified edges
+    # netconvert will auto-generate appropriate connections for the new geometry
+    if con_file and modified_count > 0:
+        actual_output_con_file = output_con_file or con_file
+        remove_connections_for_modified_edges(
+            con_file,
+            actual_output_con_file,
+            processed,
+            edge_map,
+            dry_run=dry_run
+        )
+        # Use the updated file for subsequent operations
+        con_file = actual_output_con_file
+
+    # Remove TLL connections for affected edges
+    # The TLL file references specific lane-to-lane connections that become stale
+    if modified_count > 0:
+        tll_file = input_edge_file.replace('.edg.xml', '.tll.xml')
+        if os.path.exists(tll_file):
+            # Compute affected edges (at junctions with modified edges)
+            affected_junctions: Set[str] = set()
+            for eid in processed:
+                if eid in edge_map:
+                    affected_junctions.add(edge_map[eid].from_node)
+                    affected_junctions.add(edge_map[eid].to_node)
+            affected_edges: Set[str] = set()
+            for eid, einfo in edge_map.items():
+                if einfo.from_node in affected_junctions or einfo.to_node in affected_junctions:
+                    affected_edges.add(eid)
+
+            remove_tll_for_affected_edges(
+                tll_file,
+                tll_file,  # Overwrite in place
+                affected_edges,
+                edge_map,
+                dry_run=dry_run
+            )
 
     # Shift connected edges if manually specified
     if (edges_shift_up or edges_shift_down) and modified_count > 0:
@@ -1054,6 +1097,162 @@ def add_center_lane_to_edges(
     return modified_count
 
 
+def remove_connections_for_modified_edges(
+    con_file: str,
+    output_con_file: str,
+    modified_edge_ids: Set[str],
+    edge_map: Dict[str, 'EdgeInfo'],
+    dry_run: bool = False
+) -> int:
+    """
+    Remove connections at junctions affected by modified edges.
+
+    When center lanes are added to edges, the junction geometry changes for all
+    edges meeting at those junctions. Rather than trying to shift lane indices
+    (which creates mismatches with netconvert's routing model), we remove
+    connections at affected junctions and let netconvert auto-generate them.
+
+    A junction is "affected" if any edge connecting to it was modified.
+    All connections at affected junctions are removed to avoid stale references.
+
+    Args:
+        con_file: Path to the connection XML file
+        output_con_file: Path to output connection XML file
+        modified_edge_ids: Set of edge IDs that had center lanes added
+        edge_map: Dictionary of edge ID to EdgeInfo
+        dry_run: If True, only report what would be changed
+
+    Returns:
+        Number of connections removed
+    """
+    # Find all junctions affected by modified edges
+    affected_junctions: Set[str] = set()
+    for eid in modified_edge_ids:
+        if eid in edge_map:
+            affected_junctions.add(edge_map[eid].from_node)
+            affected_junctions.add(edge_map[eid].to_node)
+
+    # Find all edges that connect to affected junctions
+    affected_edges: Set[str] = set()
+    for eid, einfo in edge_map.items():
+        if einfo.from_node in affected_junctions or einfo.to_node in affected_junctions:
+            affected_edges.add(eid)
+
+    logger.info(f"Found {len(affected_junctions)} affected junctions, "
+               f"{len(affected_edges)} affected edges (from {len(modified_edge_ids)} modified edges)")
+
+    tree = ET.parse(con_file)
+    root = tree.getroot()
+
+    to_remove = []
+    for conn_elem in root.findall('connection'):
+        from_edge = conn_elem.get('from')
+        to_edge = conn_elem.get('to')
+
+        if from_edge is None or to_edge is None:
+            continue
+
+        if from_edge in affected_edges or to_edge in affected_edges:
+            to_remove.append(conn_elem)
+
+    removed_count = len(to_remove)
+
+    if not dry_run:
+        for elem in to_remove:
+            root.remove(elem)
+
+    if not dry_run and removed_count > 0:
+        logger.info(f"Writing updated connection file: {output_con_file}")
+        ET.indent(tree, space="    ")
+        tree.write(output_con_file, encoding='UTF-8', xml_declaration=True)
+
+    logger.info(f"{'[DRY RUN] ' if dry_run else ''}Removed {removed_count} connections at affected junctions")
+    return removed_count
+
+
+def remove_tll_for_affected_edges(
+    tll_file: str,
+    output_tll_file: str,
+    affected_edges: Set[str],
+    edge_map: Dict[str, 'EdgeInfo'],
+    dry_run: bool = False
+) -> int:
+    """
+    Remove traffic light definitions and connections for affected edges from the TLL file.
+
+    The TLL file contains:
+    - <tlLogic> elements with phase state strings sized to the number of connections
+    - <connection> elements mapping signal indices to specific lane-to-lane connections
+
+    When center lanes are added and junction geometry changes, both become stale.
+    We remove them and let netconvert regenerate the traffic light programs.
+
+    Args:
+        tll_file: Path to the TLL XML file
+        output_tll_file: Path to output TLL XML file
+        affected_edges: Set of edge IDs at affected junctions
+        edge_map: Dictionary of edge ID to EdgeInfo
+        dry_run: If True, only report what would be changed
+
+    Returns:
+        Number of elements removed
+    """
+    logger.info(f"Removing TLL elements for {len(affected_edges)} affected edges")
+
+    tree = ET.parse(tll_file)
+    root = tree.getroot()
+
+    # Find all junction IDs that have affected edges
+    affected_tl_junctions: Set[str] = set()
+    for eid in affected_edges:
+        if eid in edge_map:
+            affected_tl_junctions.add(edge_map[eid].from_node)
+            affected_tl_junctions.add(edge_map[eid].to_node)
+
+    # Remove tlLogic elements for affected junctions
+    # TL IDs typically correspond to junction/node IDs
+    removed_tl_ids: Set[str] = set()
+    tl_to_remove = []
+    for tl_elem in root.findall('tlLogic'):
+        tl_id = tl_elem.get('id')
+        if tl_id in affected_tl_junctions:
+            tl_to_remove.append(tl_elem)
+            removed_tl_ids.add(tl_id)
+
+    # Remove TLL connections for affected edges OR for removed traffic lights
+    # When a tlLogic is removed, ALL its connections must also be removed
+    conn_to_remove = []
+    for conn_elem in root.findall('connection'):
+        from_edge = conn_elem.get('from')
+        to_edge = conn_elem.get('to')
+        tl_id = conn_elem.get('tl')
+
+        if from_edge is None or to_edge is None:
+            continue
+
+        if from_edge in affected_edges or to_edge in affected_edges:
+            conn_to_remove.append(conn_elem)
+        elif tl_id in removed_tl_ids:
+            conn_to_remove.append(conn_elem)
+
+    if not dry_run:
+        for elem in conn_to_remove:
+            root.remove(elem)
+        for elem in tl_to_remove:
+            root.remove(elem)
+
+    total_removed = len(conn_to_remove) + len(tl_to_remove)
+
+    if not dry_run and total_removed > 0:
+        logger.info(f"Writing updated TLL file: {output_tll_file}")
+        ET.indent(tree, space="    ")
+        tree.write(output_tll_file, encoding='UTF-8', xml_declaration=True)
+
+    logger.info(f"{'[DRY RUN] ' if dry_run else ''}Removed {len(conn_to_remove)} TLL connections "
+               f"and {len(tl_to_remove)} tlLogic definitions for affected junctions")
+    return total_removed
+
+
 def _update_lane_elements(edge_elem: ET.Element, new_lane_count: int) -> None:
     """Update lane child elements to match new lane count."""
     existing_lanes = edge_elem.findall('lane')
@@ -1083,258 +1282,6 @@ def _update_lane_elements(edge_elem: ET.Element, new_lane_count: int) -> None:
             param.set('value', orig_id)
 
 
-def calculate_edge_angle(shape_str: str, at_end: bool = True) -> float:
-    """
-    Calculate the heading angle of an edge based on its shape.
-
-    Args:
-        shape_str: Shape string
-        at_end: If True, calculate angle at the end of the edge; otherwise at the start
-
-    Returns:
-        Angle in degrees (0-360, where 0 is East, 90 is North)
-    """
-    import math
-
-    if not shape_str:
-        return 0.0
-
-    coords = parse_shape_coordinates(shape_str)
-    if len(coords) < 2:
-        return 0.0
-
-    if at_end:
-        # Use last two points to determine heading at the end
-        x1, y1 = coords[-2]
-        x2, y2 = coords[-1]
-    else:
-        # Use first two points to determine heading at the start
-        x1, y1 = coords[0]
-        x2, y2 = coords[1]
-
-    angle = math.atan2(y2 - y1, x2 - x1)
-    return math.degrees(angle) % 360
-
-
-def determine_turn_direction(from_angle: float, to_angle: float) -> str:
-    """
-    Determine the turn direction based on incoming and outgoing angles.
-
-    Returns: 'r' (right), 's' (straight), 'l' (left), or 't' (u-turn)
-    """
-    # Calculate the turn angle
-    turn = (to_angle - from_angle) % 360
-
-    # Normalize to -180 to 180
-    if turn > 180:
-        turn -= 360
-
-    # Classify the turn
-    if -45 <= turn <= 45:
-        return 's'  # straight
-    elif 45 < turn <= 135:
-        return 'l'  # left
-    elif -135 <= turn < -45:
-        return 'r'  # right
-    else:
-        return 't'  # u-turn (turn around)
-
-
-def update_connections_for_center_lane(
-    input_edge_file: str,
-    input_con_file: str,
-    output_con_file: str,
-    edge_ids: List[str],
-    dry_run: bool = False,
-    skip_updates: bool = False
-) -> int:
-    """
-    Update connections after adding center lane.
-
-    When we add a center lane, we need to:
-    1. Shift existing lane indices to make room for the new lane
-    2. Assign left turns and U-turns to the new center lane (leftmost lane)
-    3. Remove left turns and U-turns from other lanes
-
-    Args:
-        input_edge_file: Path to edge XML file
-        input_con_file: Path to connection XML file
-        output_con_file: Path to output connection XML file
-        edge_ids: List of edge IDs that were modified
-        dry_run: If True, only report changes
-        skip_updates: If True, don't modify connections at all
-
-    Returns:
-        Number of connections modified
-    """
-    if skip_updates:
-        logger.info("\nSkipping connection updates (--skip-connection-updates specified)")
-        return 0
-
-    logger.info(f"\nReading edge file: {input_edge_file}")
-    logger.info(f"Reading connection file: {input_con_file}")
-
-    # Parse edge file to get edge info
-    edge_tree = ET.parse(input_edge_file)
-    edge_root = edge_tree.getroot()
-
-    edge_map: Dict[str, EdgeInfo] = {}
-    for edge_elem in edge_root.findall('edge'):
-        edge_id = edge_elem.get('id')
-        from_node = edge_elem.get('from')
-        to_node = edge_elem.get('to')
-
-        if edge_id is None or from_node is None or to_node is None:
-            continue
-
-        edge_map[edge_id] = EdgeInfo(
-            id=edge_id,
-            from_node=from_node,
-            to_node=to_node,
-            shape=edge_elem.get('shape', ''),
-            num_lanes=int(edge_elem.get('numLanes', '1')),
-            element=edge_elem,
-            name=edge_elem.get('name')
-        )
-
-    # Find reverse edges for all specified edges
-    edge_pairs: Dict[str, str] = {}
-    for edge_id in edge_ids:
-        reverse = find_reverse_edge(edge_id, edge_map)
-        if reverse:
-            edge_pairs[edge_id] = reverse.id
-            edge_pairs[reverse.id] = edge_id
-
-    modified_edges = set(edge_pairs.keys())
-
-    # Parse connection file
-    con_tree = ET.parse(input_con_file)
-    con_root = con_tree.getroot()
-
-    modified_count = 0
-
-    # First pass: analyze all connections and determine turn directions
-    # Collect connection info for each edge
-    edge_conn_info: Dict[str, List[Tuple[ET.Element, str, int, Optional[str], int]]] = {}
-
-    for conn_elem in con_root.findall('connection'):
-        from_edge = conn_elem.get('from')
-        to_edge = conn_elem.get('to')
-
-        if from_edge is None or to_edge is None:
-            continue
-
-        # Only process connections FROM modified edges
-        if from_edge not in modified_edges:
-            continue
-
-        from_lane = int(conn_elem.get('fromLane', '0'))
-        to_lane = int(conn_elem.get('toLane', '0'))
-
-        # Get the edge info
-        if from_edge not in edge_map:
-            continue
-
-        from_edge_info = edge_map[from_edge]
-        reverse_edge_id = edge_pairs.get(from_edge)
-
-        # Determine the turn direction
-        turn_direction = None
-
-        # Check if this is a U-turn to the reverse edge
-        if reverse_edge_id and to_edge == reverse_edge_id:
-            turn_direction = 't'
-        elif to_edge in edge_map:
-            to_edge_info = edge_map[to_edge]
-            from_angle = calculate_edge_angle(from_edge_info.shape, at_end=True)
-            to_angle = calculate_edge_angle(to_edge_info.shape, at_end=False)
-            turn_direction = determine_turn_direction(from_angle, to_angle)
-
-        if from_edge not in edge_conn_info:
-            edge_conn_info[from_edge] = []
-        edge_conn_info[from_edge].append((conn_elem, to_edge, from_lane, turn_direction, to_lane))
-
-    # Second pass: fix connections for each modified edge
-    for from_edge, conn_list in edge_conn_info.items():
-        from_edge_info = edge_map[from_edge]
-        num_lanes = from_edge_info.num_lanes  # Current number of lanes (before adding)
-        left_lane = num_lanes - 1  # Leftmost lane index (this is the center lane)
-
-        # For proper lane assignment:
-        # - Leftmost lane (index num_lanes-1): left turns + U-turns ONLY
-        # - Other lanes: straight + right (no left/U-turn)
-
-        logger.info(f"\n  Processing {from_edge} ({num_lanes} lanes, leftmost={left_lane}):")
-
-        for conn_elem, to_edge, from_lane, turn_direction, to_lane in conn_list:
-            dir_names: Dict[str, str] = {'r': 'right', 's': 'straight', 'l': 'left', 't': 'U-turn'}
-            dir_name = dir_names.get(turn_direction or '', 'unknown')
-
-            if turn_direction in ('l', 't'):
-                # Left turn or U-turn: should be on leftmost lane ONLY
-                if from_lane != left_lane:
-                    # Move to leftmost lane
-                    logger.info(f"    Moving {dir_name}: lane {from_lane} -> lane {left_lane} (to {to_edge})")
-                    if not dry_run:
-                        conn_elem.set('fromLane', str(left_lane))
-                    modified_count += 1
-                else:
-                    logger.info(f"    Keeping {dir_name}: lane {from_lane} (to {to_edge})")
-            elif turn_direction in ('r', 's'):
-                # Right or straight: should NOT be on leftmost lane
-                if from_lane == left_lane:
-                    # Move straight/right from leftmost lane to the next lane (left_lane - 1)
-                    new_lane = left_lane - 1 if left_lane > 0 else 0
-                    logger.info(f"    Moving {dir_name}: lane {from_lane} -> lane {new_lane} (to {to_edge})")
-                    if not dry_run:
-                        conn_elem.set('fromLane', str(new_lane))
-                    modified_count += 1
-                else:
-                    logger.info(f"    Keeping {dir_name}: lane {from_lane} (to {to_edge})")
-
-    # Add U-turn connections for the leftmost lane if not already present
-    for edge_id in edge_ids:
-        if edge_id not in edge_pairs:
-            continue
-
-        reverse_id = edge_pairs[edge_id]
-        edge_info = edge_map.get(edge_id)
-        if not edge_info:
-            continue
-
-        left_lane = edge_info.num_lanes - 1
-
-        # Check if U-turn connection already exists from left lane
-        uturn_exists = False
-        for conn_elem in con_root.findall('connection'):
-            if (conn_elem.get('from') == edge_id and
-                conn_elem.get('to') == reverse_id and
-                int(conn_elem.get('fromLane', '0')) == left_lane):
-                uturn_exists = True
-                break
-
-        if not uturn_exists:
-            logger.info(f"  Adding U-turn connection: {edge_id}:{left_lane} -> {reverse_id}:{left_lane}")
-
-            if not dry_run:
-                new_conn = ET.SubElement(con_root, 'connection')
-                new_conn.set('from', edge_id)
-                new_conn.set('to', reverse_id)
-                new_conn.set('fromLane', str(left_lane))
-                new_conn.set('toLane', str(left_lane))
-
-            modified_count += 1
-
-    if not dry_run and modified_count > 0:
-        logger.info(f"\nWriting modified connection file: {output_con_file}")
-        ET.indent(con_tree, space="    ")
-        con_tree.write(output_con_file, encoding='UTF-8', xml_declaration=True)
-
-    logger.info(f"\n{'[DRY RUN] ' if dry_run else ''}Modified/added {modified_count} connections")
-
-    return modified_count
-
-
 def main():
     parser = argparse.ArgumentParser(
         description='Add bidirectional center lane to SUMO road edges',
@@ -1352,10 +1299,6 @@ Examples:
       --edges "8974919201#0" \\
       --shift-up "8974919180#0" \\
       --shift-down "4126464930#0"
-
-  # Add center lane and update connections
-  python add_bidirectional_center_lane.py Ann_Arbor/aa_plain.edg.xml \\
-      --edges "23481137010#0" --update-connections --modify-connections
 
   # Specify output files
   python add_bidirectional_center_lane.py Ann_Arbor/aa_plain.edg.xml \\
@@ -1386,7 +1329,12 @@ Road Configuration:
         nargs='+',
         required=False,
         default=None,
-        help='Edge IDs to add center lane to (required unless using --node-up/--node-down only)'
+        help='Edge IDs to add center lane to (required unless using --osm-file or --node-up/--node-down)'
+    )
+
+    parser.add_argument(
+        '--osm-file',
+        help='OSM XML file to auto-detect edges with centre_turn_lane=yes tag'
     )
 
     parser.add_argument(
@@ -1405,26 +1353,6 @@ Road Configuration:
         '--con-output',
         help='Output connection XML file (default: overwrites input)',
         default=None
-    )
-
-    parser.add_argument(
-        '--update-connections',
-        action='store_true',
-        help='Also update connection file for new lane configuration'
-    )
-
-    parser.add_argument(
-        '--skip-connection-updates',
-        action='store_true',
-        default=True,
-        help='Skip updating connection lane assignments (default: True, only update edge file)'
-    )
-
-    parser.add_argument(
-        '--modify-connections',
-        action='store_false',
-        dest='skip_connection_updates',
-        help='Enable connection lane assignment modifications (overrides --skip-connection-updates)'
     )
 
     parser.add_argument(
@@ -1512,11 +1440,33 @@ Road Configuration:
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
+    # Auto-detect edges from OSM file if provided
+    if args.osm_file:
+        if not os.path.exists(args.osm_file):
+            logger.error(f"OSM file not found: {args.osm_file}")
+            sys.exit(1)
+
+        osm_way_ids = parse_osm_centre_turn_lanes(args.osm_file)
+        if not osm_way_ids:
+            logger.error("No ways with centre_turn_lane=yes found in OSM file")
+            sys.exit(1)
+
+        osm_edges = find_edges_by_osm_ids(args.input_edge_file, osm_way_ids, deduplicate_segments=True)
+        if not osm_edges:
+            logger.error("No matching edges found in edge file for OSM way IDs")
+            sys.exit(1)
+
+        # Merge with manually specified edges if any
+        if args.edges:
+            args.edges.extend(osm_edges)
+        else:
+            args.edges = osm_edges
+
     # Validate that either --edges, edge shifting, or node shifting options are provided
     has_node_shift = args.node_up or args.node_down or args.node_left or args.node_right
     has_edge_shift = args.shift_up or args.shift_down
     if not args.edges and not has_node_shift and not has_edge_shift:
-        logger.error("Either --edges, --shift-up/--shift-down, or --node-up/--node-down/--node-left/--node-right must be specified")
+        logger.error("Either --edges, --osm-file, --shift-up/--shift-down, or --node-up/--node-down/--node-left/--node-right must be specified")
         sys.exit(1)
 
     if not os.path.exists(args.input_edge_file):
@@ -1536,14 +1486,15 @@ Road Configuration:
     node_output = args.node_output if args.node_output else node_file
 
     # Determine connection file (default: infer from edge file)
-    con_file_for_center_lanes = None
-    if args.shift_up or args.shift_down:
-        con_file_for_center_lanes = args.con_file
-        if not con_file_for_center_lanes:
-            con_file_for_center_lanes = args.input_edge_file.replace('.edg.xml', '.con.xml')
-            if not os.path.exists(con_file_for_center_lanes):
-                logger.warning(f"Connection file not found: {con_file_for_center_lanes} - connections will not be added")
-                con_file_for_center_lanes = None
+    # Always resolve the connection file when edges are being modified,
+    # so lane indices can be shifted to match the new lane layout
+    con_file_for_center_lanes = args.con_file
+    if not con_file_for_center_lanes:
+        con_file_for_center_lanes = args.input_edge_file.replace('.edg.xml', '.con.xml')
+        if not os.path.exists(con_file_for_center_lanes):
+            if args.shift_up or args.shift_down:
+                logger.warning(f"Connection file not found: {con_file_for_center_lanes} - connections will not be updated")
+            con_file_for_center_lanes = None
 
     con_output = args.con_output if args.con_output else con_file_for_center_lanes
 
@@ -1711,27 +1662,6 @@ Road Configuration:
             con_file=con_file_for_center_lanes,
             output_con_file=con_output
         )
-
-        # Update connections if requested
-        if args.update_connections:
-            con_file = args.con_file
-            if not con_file:
-                con_file = args.input_edge_file.replace('.edg.xml', '.con.xml')
-
-            if not os.path.exists(con_file):
-                logger.error(f"Connection file not found: {con_file}")
-                sys.exit(1)
-
-            con_output = args.con_output if args.con_output else con_file
-
-            update_connections_for_center_lane(
-                input_edge_file=output_edge_file if not args.dry_run else args.input_edge_file,
-                input_con_file=con_file,
-                output_con_file=con_output,
-                edge_ids=args.edges,
-                dry_run=args.dry_run,
-                skip_updates=args.skip_connection_updates
-            )
 
         if modified > 0 and not args.dry_run:
             logger.info("\nNext steps:")
