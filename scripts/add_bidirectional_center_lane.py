@@ -459,6 +459,125 @@ def shift_nodes_for_edges(
     return shifted_count
 
 
+def shift_nodes_for_asymmetric_edges(
+    node_file: str,
+    output_node_file: str,
+    edge_map: Dict[str, EdgeInfo],
+    asymmetric_edge_ids: List[Tuple[str, bool]],
+    lane_width: float,
+    dry_run: bool = False
+) -> int:
+    """
+    Shift nodes connected to asymmetric edge pairs.
+
+    For each asymmetric edge, the node shift is computed relative to the
+    forward edge's direction so it works for roads at any orientation:
+      - half lane width perpendicular (direction depends on shift_up flag)
+      - one lane width along the road (direction depends on shift_up flag)
+
+    When shift_up=True (forward has more lanes):
+      - perpendicular: LEFT of forward direction
+      - along-road: FORWARD (away from center)
+    When shift_up=False (reverse has more lanes):
+      - perpendicular: RIGHT of forward direction
+      - along-road: BACKWARD (away from center)
+
+    Args:
+        node_file: Path to input node XML file
+        output_node_file: Path to output node XML file
+        edge_map: Dictionary of edge ID to EdgeInfo
+        asymmetric_edge_ids: List of (forward edge ID, shift_up) tuples
+        lane_width: Full lane width in meters
+        dry_run: If True, only report changes
+
+    Returns:
+        Number of nodes shifted
+    """
+    if not asymmetric_edge_ids:
+        return 0
+
+    logger.info(f"\nShifting nodes for {len(asymmetric_edge_ids)} asymmetric edge pairs")
+
+    tree = ET.parse(node_file)
+    root = tree.getroot()
+
+    # Build node map
+    node_map: Dict[str, ET.Element] = {}
+    for node_elem in root.findall('node'):
+        node_id = node_elem.get('id')
+        if node_id:
+            node_map[node_id] = node_elem
+
+    half_width = lane_width / 2
+    shifted_nodes: Set[str] = set()
+    shifted_count = 0
+
+    for edge_id, shift_up in asymmetric_edge_ids:
+        if edge_id not in edge_map:
+            continue
+
+        edge = edge_map[edge_id]
+        reverse_edge = find_reverse_edge(edge_id, edge_map)
+
+        # Get edge direction vector from the forward edge's shape
+        dx, dy = calculate_edge_direction(edge.shape)
+
+        if shift_up:
+            # LEFT perpendicular + forward along road
+            perp_x, perp_y = -dy, dx
+            along_x, along_y = dx, dy
+        else:
+            # RIGHT perpendicular + backward along road
+            perp_x, perp_y = dy, -dx
+            along_x, along_y = -dx, -dy
+
+        # Node shift = half_width * perpendicular + lane_width * along-road
+        shift_x = half_width * perp_x + lane_width * along_x
+        shift_y = half_width * perp_y + lane_width * along_y
+
+        shift_label = 'UP' if shift_up else 'DOWN'
+        logger.info(f"  Edge pair {edge_id}: shifting nodes {shift_label} "
+                   f"[perp=({perp_x:.3f},{perp_y:.3f}), along=({along_x:.3f},{along_y:.3f})]")
+
+        # Collect all nodes for this edge pair
+        nodes = {edge.from_node, edge.to_node}
+        if reverse_edge:
+            nodes.add(reverse_edge.from_node)
+            nodes.add(reverse_edge.to_node)
+
+        for node_id in nodes:
+            if node_id in shifted_nodes:
+                continue
+            if node_id not in node_map:
+                logger.warning(f"  Node not found: {node_id}")
+                continue
+
+            node_elem = node_map[node_id]
+            x = float(node_elem.get('x', '0'))
+            y = float(node_elem.get('y', '0'))
+            new_x = x + shift_x
+            new_y = y + shift_y
+
+            logger.info(f"    Node {node_id}: ({x:.2f},{y:.2f}) -> ({new_x:.2f},{new_y:.2f}) "
+                       f"[dx={shift_x:.2f}, dy={shift_y:.2f}]")
+
+            if not dry_run:
+                node_elem.set('x', f"{new_x:.2f}")
+                node_elem.set('y', f"{new_y:.2f}")
+
+            shifted_nodes.add(node_id)
+            shifted_count += 1
+
+    if not dry_run and shifted_count > 0:
+        logger.info(f"\nWriting modified node file: {output_node_file}")
+        ET.indent(tree, space="    ")
+        tree.write(output_node_file, encoding='UTF-8', xml_declaration=True)
+
+    logger.info(f"\n{'[DRY RUN] ' if dry_run else ''}Shifted {shifted_count} nodes for asymmetric edges")
+
+    return shifted_count
+
+
 def shift_specific_nodes(
     node_file: str,
     output_node_file: str,
@@ -890,6 +1009,7 @@ def add_center_lane_to_edges(
 
     # Process specified edges
     processed: Set[str] = set()
+    asymmetric_edge_ids: List[Tuple[str, bool]] = []  # (forward edge ID, shift_up) for node shifting
     modified_count = 0
 
     for edge_id in edge_ids:
@@ -912,10 +1032,16 @@ def add_center_lane_to_edges(
         logger.info(f"  Current lanes: {edge.num_lanes} / {reverse_edge.num_lanes}")
 
         # Skip if edge was already processed by this script in a previous run
-        # Check for a <param key="centerLaneAdded" value="true"/> child element
         center_lane_param = edge.element.find("param[@key='centerLaneAdded']")
+        asymmetric_param = edge.element.find("param[@key='asymmetricShifted']")
         if center_lane_param is not None and center_lane_param.get('value') == 'true':
             logger.warning(f"  Edge {edge_id} already has centerLaneAdded param - skipping "
+                          f"(already processed in a previous run)")
+            processed.add(edge_id)
+            processed.add(reverse_edge.id)
+            continue
+        if asymmetric_param is not None and asymmetric_param.get('value') == 'true':
+            logger.warning(f"  Edge {edge_id} already has asymmetricShifted param - skipping "
                           f"(already processed in a previous run)")
             processed.add(edge_id)
             processed.add(reverse_edge.id)
@@ -927,15 +1053,54 @@ def add_center_lane_to_edges(
                           f"Ensure node file is available to derive shape from node coordinates.")
             continue
 
-        # Skip asymmetric pairs (different lane counts between forward and reverse).
-        # Center lane insertion only makes sense when both directions have the same
-        # number of lanes, giving an even total (N + N). Odd totals (N + M, N != M)
-        # indicate an unusual road geometry that shouldn't be modified.
+        # Handle asymmetric pairs (different lane counts between forward and reverse).
+        # Don't add center lanes, but shift both edges by half a lane width in the
+        # same absolute direction. Uses opposite relative directions (left/right)
+        # because the edges face opposite ways — same pattern as shift_edge_pair().
+        #
+        # Shift direction depends on which edge has more lanes:
+        #   forward > reverse → shift UP (forward=left, reverse=right)
+        #   forward < reverse → shift DOWN (forward=right, reverse=left)
         if edge.num_lanes != reverse_edge.num_lanes:
-            logger.warning(f"  Skipping asymmetric pair: {edge.id} has {edge.num_lanes} lanes, "
-                          f"{reverse_edge.id} has {reverse_edge.num_lanes} lanes")
+            half_width = lane_width / 2
+            shift_up = edge.num_lanes > reverse_edge.num_lanes
+
+            if shift_up:
+                fwd_dir = 'left'
+                rev_dir = 'right'
+                shift_label = 'UP'
+            else:
+                fwd_dir = 'right'
+                rev_dir = 'left'
+                shift_label = 'DOWN'
+
+            logger.info(f"  Asymmetric pair ({edge.num_lanes} vs {reverse_edge.num_lanes} lanes) "
+                       f"- shifting {shift_label} by {half_width:.2f}m")
+
+            if not dry_run:
+                original_shape = edge.shape
+                original_reverse_shape = reverse_edge.shape
+                if not original_reverse_shape and original_shape:
+                    original_reverse_shape = reverse_shape(original_shape)
+
+                new_shape_1 = offset_shape(original_shape, half_width, direction=fwd_dir)
+                edge.element.set('shape', new_shape_1)
+                param1 = ET.SubElement(edge.element, 'param')
+                param1.set('key', 'asymmetricShifted')
+                param1.set('value', 'true')
+
+                new_shape_2 = offset_shape(original_reverse_shape, half_width, direction=rev_dir)
+                reverse_edge.element.set('shape', new_shape_2)
+                param2 = ET.SubElement(reverse_edge.element, 'param')
+                param2.set('key', 'asymmetricShifted')
+                param2.set('value', 'true')
+
+                logger.info(f"  Shifted {edge.id} {fwd_dir}, {reverse_edge.id} {rev_dir} ({shift_label})")
+
             processed.add(edge_id)
             processed.add(reverse_edge.id)
+            asymmetric_edge_ids.append((edge_id, shift_up))
+            modified_count += 1
             continue
 
         # Calculate new lane count (same for both edges since they're symmetric)
@@ -1084,6 +1249,26 @@ def add_center_lane_to_edges(
                 edge_ids,
                 edges_shift_up or [],
                 edges_shift_down or [],
+                dry_run
+            )
+
+    # Shift nodes for asymmetric edge pairs
+    if asymmetric_edge_ids and modified_count > 0:
+        # Determine the node file path (may have been modified by manual shift above)
+        actual_node_file = node_file
+        if not actual_node_file:
+            inferred = input_edge_file.replace('.edg.xml', '.nod.xml')
+            if os.path.exists(inferred):
+                actual_node_file = inferred
+
+        if actual_node_file:
+            actual_output_node_file = output_node_file or actual_node_file
+            shift_nodes_for_asymmetric_edges(
+                actual_node_file,
+                actual_output_node_file,
+                edge_map,
+                asymmetric_edge_ids,
+                lane_width,
                 dry_run
             )
 
