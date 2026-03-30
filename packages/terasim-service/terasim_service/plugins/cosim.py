@@ -322,6 +322,12 @@ class TeraSimCoSimPlugin(BasePlugin):
                 if command == "tick":
                     break  # Proceed with the simulation step
                 else:
+                    # Set status to wait_for_tick when waiting for next tick command
+                    current_status = self.redis_client.get(f"simulation:{self.simulation_uuid}:status")
+                    if current_status and current_status.decode("utf-8") == "ticked":
+                        self.redis_client.set(
+                            f"simulation:{self.simulation_uuid}:status", "wait_for_tick", ex=self.key_expiry
+                        )
                     time.sleep(0.005)  # Short sleep to prevent busy waiting
                     continue
 
